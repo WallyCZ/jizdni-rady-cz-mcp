@@ -34,10 +34,10 @@ workflow `update-upstream.yml`).
 
 Workflow `docker.yml` při každém pushi do `main` sestaví image pro
 `linux/amd64` i `linux/arm64` a publikuje ho jako
-`ghcr.io/<owner>/<repo>:latest` (a `sha-<commit>`; tag `v1.2.3` přidá `1.2.3`).
+`ghcr.io/wallycz/jizdni-rady-cz:latest` (a `sha-<commit>`; tag `v1.2.3` přidá `1.2.3`).
 
 ```powershell
-docker run --rm -i ghcr.io/<owner>/<repo>:latest
+docker run --rm -i ghcr.io/wallycz/jizdni-rady-cz:latest
 ```
 
 ## Docker
@@ -47,12 +47,18 @@ docker build -t jizdni-rady-cz-mcp .
 docker run --rm -i jizdni-rady-cz-mcp
 ```
 
-Stejný server lze sestavit a spustit přes Compose:
+`compose.yaml` používá hotový image z GHCR (konkrétní verzi zvolí proměnná
+`IMAGE_TAG`, výchozí je `latest`). Balíček je soukromý, takže je nejdřív třeba
+`docker login ghcr.io` s tokenem, který má `read:packages`:
 
 ```powershell
-docker compose build
+docker compose pull
 docker compose --profile stdio run --rm -i mcp
 ```
+
+Novější image stáhne `docker compose pull`. Lokálně sestavený image použije
+Compose, když ho označíte stejným jménem
+(`docker build -t ghcr.io/wallycz/jizdni-rady-cz:latest .`).
 
 ## Home Assistant
 
@@ -63,9 +69,6 @@ SSE endpoint. Spusťte ji takto:
 ```powershell
 docker compose up -d hass-mcp
 ```
-
-Místo lokálního sestavení lze v `compose.yaml` použít hotový image z GHCR
-(`image: ghcr.io/<owner>/<repo>:latest` a odstranit `build:`).
 
 V Home Assistant otevřete **Settings → Devices & services → Add integration →
 Model Context Protocol** a jako **SSE Server URL** zadejte:
