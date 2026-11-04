@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from mcp.server.fastmcp import FastMCP
 
+from . import planner
 from .index import build
 
 mcp = FastMCP("Jízdní řády ČR")
@@ -230,42 +231,131 @@ def departures(
     return _trip_rows(rows, _active_services(day), limit)
 
 
+@lru_cache(maxsize=4)
+def _active_trips(day: date) -> frozenset[int]:
+    active = _active_services(day)
+    return frozenset(trip for trip, service in _query("SELECT id, service_id FROM trips") if service in active)
+
+
+@lru_cache(maxsize=1)
+def _footpaths() -> dict[int, list[tuple[int, int]]]:
+    paths: dict[int, list[tuple[int, int]]] = {}
+    for from_stop, to_stop, seconds in _query("SELECT from_stop, to_stop, seconds FROM footpaths"):
+        paths.setdefault(from_stop, []).append((to_stop, seconds))
+    return paths
+
+
+def _stop_number(stop: dict[str, str]) -> int:
+    return _query("SELECT id FROM stops WHERE stop_id = ?", stop["stop_id"])[0][0]
+
+
+@lru_cache(maxsize=4096)
+def _stop_name(number: int) -> str:
+    return _query("SELECT stop_name FROM stops WHERE id = ?", number)[0][0]
+
+
+def _leg(leg: planner.Ride | planner.Walk) -> dict[str, Any]:
+    if isinstance(leg, planner.Walk):
+        return {
+            "type": "walk",
+            "from_stop": _stop_name(leg.from_stop),
+            "to_stop": _stop_name(leg.to_stop),
+            "minutes": round(leg.seconds / 60),
+        }
+    trip = _query(
+        """SELECT t.trip_id, r.route_short_name, r.route_long_name, r.route_type
+           FROM trips t LEFT JOIN routes r ON r.route_id = t.route_id WHERE t.id = ?""",
+        leg.trip,
+    )[0]
+    return {
+        "type": "ride",
+        "route_short_name": trip["route_short_name"] or "",
+        "route_long_name": trip["route_long_name"] or "",
+        "mode": _MODES.get(trip["route_type"], trip["route_type"]),
+        "from_stop": _stop_name(leg.board_stop),
+        "departure_time": _clock(leg.departure),
+        "to_stop": _stop_name(leg.alight_stop),
+        "arrival_time": _clock(leg.arrival),
+        "trip_id": trip["trip_id"],
+    }
+
+
+_MODES = {"0": "tramvaj", "1": "metro", "2": "vlak", "3": "autobus", "4": "přívoz",
+          "7": "lanovka", "11": "trolejbus"}
+
+
 @mcp.tool()
-def direct_connections(
+def connections(
     from_stop: str,
     to_stop: str,
     service_date: str | None = None,
     from_time: str | None = None,
-    limit: int = 10,
+    max_changes: int = 3,
+    limit: int = 5,
 ) -> dict[str, Any]:
-    """Najde přímé spoje mezi dvěma zastávkami podle názvu.
+    """Najde spojení mezi dvěma zastávkami podle názvu, přímá i s přestupy.
 
-    Zvládá běžné české pádové tvary názvů (např. „z Radlické“). Pro přestupy
-    použijte samostatně search_stops a departures; tento nástroj hledá jen
-    jednu linku bez přestupu.
+    Vrátí nejbližší spojení odjíždějící od from_time (výchozí: teď, je-li datum
+    dnešní, jinak 00:00). Pro každý odjezd jen ta spojení, která nejsou horší
+    v čase příjezdu i v počtu přestupů. Přestupy mezi blízkými zastávkami
+    (do ~400 m) jdou pěšky. Zvládá běžné české pádové tvary názvů
+    (např. „z Drinopolu na Radlickou“).
     """
     origin, destination = _resolve_stop(from_stop), _resolve_stop(to_stop)
+    if origin["stop_id"] == destination["stop_id"]:
+        raise ValueError("Výchozí a cílová zastávka jsou stejné.")
+    now = datetime.now(ZoneInfo("Europe/Prague"))
     day = _requested_date(service_date)
-    start = _seconds(from_time) if from_time else 0
-    limit = max(1, min(limit, 30))
-    rows = _db().execute(
-        """SELECT a.departure, b.arrival, t.trip_id, t.route_id, t.service_id,
-                  r.route_short_name, r.route_long_name
-           FROM stop_times a
-           JOIN stop_times b ON b.trip = a.trip AND b.stop_sequence > a.stop_sequence
-                            AND b.stop = (SELECT id FROM stops WHERE stop_id = ?)
-           JOIN trips t ON t.id = a.trip
-           LEFT JOIN routes r ON r.route_id = t.route_id
-           WHERE a.stop = (SELECT id FROM stops WHERE stop_id = ?) AND a.departure >= ?
-           ORDER BY a.departure""",
-        (destination["stop_id"], origin["stop_id"], start),
-    )
+    if from_time:
+        start = _seconds(from_time)
+    elif day == now.date():
+        start = now.hour * 3600 + now.minute * 60
+    else:
+        start = 0
+    limit = max(1, min(limit, 10))
+    max_rides = max(0, min(max_changes, 4)) + 1
+    active, footpaths = _active_trips(day), _footpaths()
+    origin_id, destination_id = _stop_number(origin), _stop_number(destination)
+
+    found: list[dict[str, Any]] = []
+    seen: set[tuple] = set()
+    search_from, last = start, start + _SEARCH_WINDOW
+    while len(found) < limit and search_from <= last:
+        journeys = planner.earliest(
+            _db(), active, footpaths, origin_id, destination_id, search_from,
+            max_rides, _CHANGE_TIME, _HORIZON)
+        if not journeys:
+            break
+        first_departures = []
+        for arrival, legs in journeys:
+            rides = [leg for leg in legs if isinstance(leg, planner.Ride)]
+            lead = legs[0].seconds if isinstance(legs[0], planner.Walk) else 0
+            departure = rides[0].departure - lead
+            first_departures.append(rides[0].departure)
+            key = tuple((leg.trip, leg.board_stop, leg.alight_stop) for leg in rides)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append({
+                "departure_time": _clock(departure),
+                "arrival_time": _clock(arrival),
+                "duration_minutes": round((arrival - departure) / 60),
+                "changes": len(rides) - 1,
+                "legs": [_leg(leg) for leg in legs],
+            })
+        search_from = min(first_departures) + 60
+    found.sort(key=lambda item: (item["departure_time"], item["arrival_time"]))
     return {
         "origin": {key: origin.get(key, "") for key in ("stop_id", "stop_name")},
         "destination": {key: destination.get(key, "") for key in ("stop_id", "stop_name")},
         "service_date": day.isoformat(),
-        "connections": _trip_rows(rows, _active_services(day), limit),
+        "connections": found[:limit],
     }
+
+
+_CHANGE_TIME = 120          # s to change between trips at the same stop
+_HORIZON = 6 * 3600         # s, the longest journey looked for
+_SEARCH_WINDOW = 4 * 3600   # s after from_time in which departures are looked for
 
 
 def main() -> None:

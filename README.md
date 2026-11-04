@@ -11,14 +11,30 @@ přes standardní vstup/výstup, proto nemá ani nepotřebuje síťový port.
 - `search_stops` — vyhledání zastávky, včetně `stop_id` a souřadnic.
 - `search_routes` — vyhledání linek podle čísla či názvu.
 - `departures` — plánované odjezdy ze zastávky pro datum a časové okno.
-- `direct_connections` — přímé spoje mezi dvěma názvy zastávek; umí zvolit
-  dnešní datum i běžné české pádové tvary názvů.
+- `connections` — spojení mezi dvěma názvy zastávek, přímá i s přestupy
+  (nejvýš `max_changes`, výchozí 3). Pro každý odjezd vrátí jen spojení, která
+  nejsou horší v čase příjezdu i v počtu přestupů; každý úsek s linkou,
+  druhem dopravy, časy a přestupy pěšky. Umí dnešní datum, aktuální čas
+  i běžné české pádové tvary názvů („z Drinopolu na Radlickou“).
 
-`departures` respektuje běžný GTFS kalendář i výjimky (`calendar_dates.txt`).
-Dotazy jdou do SQLite indexu (`gtfs.sqlite`, ~220 MB), který se z GTFS souborů
+Oba nástroje respektují GTFS kalendář i výjimky (`calendar_dates.txt`). Časy
+po půlnoci jsou podle GTFS větší než 24:00 (`24:03:00` je 0:03 dalšího dne).
+
+Dotazy jdou do SQLite indexu (`gtfs.sqlite`, ~330 MB), který se z GTFS souborů
 sestaví předem (`python -m jizdni_rady_mcp.index <gtfs-adresář> <výstup.sqlite>`,
-asi minutu). Odjezdy i přímé spoje pak trvají desítky milisekund. Docker image
-obsahuje jen tento index, GTFS soubory v něm nejsou.
+asi 1–2 minuty). Odjezdy pak trvají desítky milisekund, spojení po Praze pod
+sekundu a dálková 2–3 s. Docker image obsahuje jen tento index, GTFS soubory
+v něm nejsou.
+
+Spojení hledá algoritmus Connection Scan nad úseky spojů seřazenými podle
+odjezdu. Přestup na stejné zastávce trvá nejméně 2 minuty, pěšky se přestupuje
+mezi zastávkami do 400 m vzdušnou čarou (1 m/s, zaokrouhleno na minuty).
+Upstream data mají dvě vady, se kterými index počítá:
+
+- obce stejného jména sdílejí jednu zastávku (Říčany u Prahy i u Brna), takže
+  spoj z ní zdánlivě přeskočí přes republiku; úseky rychlejší než 200 km/h
+  na vzdálenost nad 2 km se proto do plánovače nedostanou,
+- 384 zastávek má souřadnice 0,0; z nich ani na ně se pěšky nepřestupuje.
 
 ## Získání zdrojů
 

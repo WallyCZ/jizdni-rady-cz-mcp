@@ -3,7 +3,8 @@ name = "jizdni-rady-cz-mcp"
 version = "0.1.0"
 description = "MCP server for the Czech Republic GTFS dataset"
 requires-python = ">=3.12"
-dependencies = ["mcp>=1.0,<2.0"]
+# tzdata: Europe/Prague where the system has no time zone database (Windows).
+dependencies = ["mcp>=1.0,<2.0", "tzdata"]
 
 [project.scripts]
 jizdni-rady-cz-mcp = "jizdni_rady_mcp.server:main"
