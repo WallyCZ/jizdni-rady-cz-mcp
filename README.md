@@ -48,8 +48,8 @@ docker run --rm -i jizdni-rady-cz-mcp
 ```
 
 `compose.yaml` používá hotový image z GHCR (konkrétní verzi zvolí proměnná
-`IMAGE_TAG`, výchozí je `latest`). Balíček je soukromý, takže je nejdřív třeba
-`docker login ghcr.io` s tokenem, který má `read:packages`:
+`IMAGE_TAG`, výchozí je `latest`). Balíček je veřejný, přihlášení do GHCR
+není potřeba:
 
 ```powershell
 docker compose pull

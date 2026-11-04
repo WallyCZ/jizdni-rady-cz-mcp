@@ -1,6 +1,5 @@
 # Image sestavuje GitHub Actions (.github/workflows/docker.yml) a publikuje
-# na ghcr.io. Balíček je soukromý, proto nejdřív:
-#   docker login ghcr.io -u <github-uživatel>   (heslo: PAT s read:packages)
+# na ghcr.io (veřejný balíček, přihlášení není potřeba).
 # Lokálně sestavený image: docker build -t ghcr.io/wallycz/jizdni-rady-cz:latest .
 
 x-image: &image
