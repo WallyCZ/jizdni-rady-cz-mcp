@@ -1,0 +1,7 @@
+.git
+upstream/.git
+upstream/data/sources/
+upstream/data/gtfs_output/
+upstream/data/tt_source/
+**/__pycache__
+.venv

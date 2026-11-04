@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1
+
+# The official Python image is multi-architecture (including linux/amd64 and
+# linux/arm64). Do not pin --platform here: Buildx selects the target variant.
+# The repository's GitHub Actions workflow uses Python 3.12 and the scripts
+# rely only on the Python standard library.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=Europe/Prague
+
+WORKDIR /app
+
+# Keep the image usable when the source repository is mounted read-only.
+RUN groupadd --system app && useradd --system --gid app --create-home app
+
+# The upstream repository is a git submodule in ./upstream.
+COPY --chown=app:app upstream/ .
+
+USER app
+
+# A safe default: check the bundled, merged GTFS dataset.  Pass another
+# script and its arguments to `docker run` to run a different pipeline step.
+ENTRYPOINT ["python", "-u"]
+CMD ["scripts/validate_gtfs.py", "data/merged"]

@@ -1,0 +1,3 @@
+[submodule "upstream"]
+	path = upstream
+	url = https://github.com/tangero/jizdni-rady-czech-republic.git

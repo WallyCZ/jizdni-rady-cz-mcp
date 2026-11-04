@@ -1,0 +1,26 @@
+services:
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jizdni-rady-cz-mcp:local
+    profiles: ["stdio"]
+    stdin_open: true
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  hass-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jizdni-rady-cz-mcp:local
+    command: ["mcp-proxy", "--host", "0.0.0.0", "--port", "8000", "jizdni-rady-cz-mcp"]
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
