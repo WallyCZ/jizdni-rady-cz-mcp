@@ -17,7 +17,14 @@ from mcp.server.fastmcp import FastMCP
 from . import planner
 from .index import build
 
-mcp = FastMCP("Jízdní řády ČR")
+mcp = FastMCP(
+    "Jízdní řády ČR",
+    instructions=(
+        "Jízdní řády veřejné dopravy v ČR. Na otázku, jak se dostat z jednoho místa "
+        "na druhé, zavolej connections s názvy obou zastávek: vrátí hotová spojení "
+        "i s přestupy. departures je jen odjezdová tabule jedné zastávky."
+    ),
+)
 DATASET = Path(os.environ.get("GTFS_DATASET", "data/merged"))
 # The index: GTFS_DB, else the one installed beside the package (the Docker
 # image puts it there, so it is found even when a launcher such as mcp-proxy
@@ -214,9 +221,11 @@ def departures(
     to_time: str = "23:59:59",
     limit: int = 30,
 ) -> list[dict[str, str]]:
-    """Vrátí plánované odjezdy ze zastávky pro zadané datum a časové okno.
+    """Odjezdová tabule jedné zastávky: odjezdy linek pro datum a časové okno.
 
-    Nejprve použijte search_stops pro získání stop_id. Časy GTFS mohou přesáhnout 24:00.
+    Neříká, kudy a kam spoj jede, takže se nehodí k hledání cesty z A do B;
+    na to slouží connections. stop_id získáš ze search_stops. Časy GTFS mohou
+    přesáhnout 24:00.
     """
     day = _requested_date(service_date)
     start = _seconds(from_time) if from_time else 0
@@ -287,6 +296,22 @@ def _leg(leg: planner.Ride | planner.Walk) -> dict[str, Any]:
     }
 
 
+def _short(clock: str) -> str:
+    return clock[:5]
+
+
+def _summary(legs: list[dict[str, Any]]) -> str:
+    """The journey in one line: 14:02 tramvaj 22 z Praha, Drinopol do ... (14:31)."""
+    parts = []
+    for leg in legs:
+        if leg["type"] == "walk":
+            parts.append(f"pěšky {leg['minutes']} min na {leg['to_stop']}")
+        else:
+            parts.append(f"{_short(leg['departure_time'])} {leg['mode']} {leg['route_short_name']} "
+                         f"z {leg['from_stop']} do {leg['to_stop']} ({_short(leg['arrival_time'])})")
+    return ", ".join(parts)
+
+
 _MODES = {"0": "tramvaj", "1": "metro", "2": "vlak", "3": "autobus", "4": "přívoz",
           "7": "lanovka", "11": "trolejbus"}
 
@@ -300,13 +325,18 @@ def connections(
     max_changes: int = 3,
     limit: int = 5,
 ) -> dict[str, Any]:
-    """Najde spojení mezi dvěma zastávkami podle názvu, přímá i s přestupy.
+    """Vyhledá spojení z jedné zastávky do druhé, přímá i s přestupy. Použij ho na
+    každý dotaz typu „jak se dostanu z A do B“, „najdi spojení“, „kdy mi to jede“.
 
-    Vrátí nejbližší spojení odjíždějící od from_time (výchozí: teď, je-li datum
-    dnešní, jinak 00:00). Pro každý odjezd jen ta spojení, která nejsou horší
-    v čase příjezdu i v počtu přestupů. Přestupy mezi blízkými zastávkami
-    (do ~400 m) jdou pěšky. Zvládá běžné české pádové tvary názvů
-    (např. „z Drinopolu na Radlickou“).
+    from_stop a to_stop jsou názvy zastávek, jak je řekl uživatel (stop_id ani
+    search_stops nejsou potřeba, pádové tvary jako „z Drinopolu“ „na Radlickou“
+    fungují). Bez service_date a from_time hledá dnes od teď.
+
+    Vrátí nejbližší spojení seřazená podle odjezdu. Každé má celou trasu v legs:
+    jízdy (linka, druh dopravy, nástupní a výstupní zastávka, odjezd, příjezd)
+    a přesuny pěšky mezi blízkými zastávkami. Výsledek je spočítaný z jízdního
+    řádu včetně návazností, takže ho uživateli podej tak, jak je; neskládej
+    spojení sám z departures. Časy nad 24:00 jsou po půlnoci.
     """
     origin, destination = _resolve_stop(from_stop), _resolve_stop(to_stop)
     if origin["stop_id"] == destination["stop_id"]:
@@ -343,12 +373,14 @@ def connections(
             if key in seen:
                 continue
             seen.add(key)
+            described = [_leg(leg) for leg in legs]
             found.append({
                 "departure_time": _clock(departure),
                 "arrival_time": _clock(arrival),
                 "duration_minutes": round((arrival - departure) / 60),
                 "changes": len(rides) - 1,
-                "legs": [_leg(leg) for leg in legs],
+                "summary": _summary(described),
+                "legs": described,
             })
         search_from = min(first_departures) + 60
     found.sort(key=lambda item: (item["departure_time"], item["arrival_time"]))
