@@ -10,7 +10,8 @@ přes standardní vstup/výstup, proto nemá ani nepotřebuje síťový port.
 - `dataset_summary` — velikost a rozsah připojeného datasetu.
 - `search_stops` — vyhledání zastávky, včetně `stop_id` a souřadnic.
 - `search_routes` — vyhledání linek podle čísla či názvu.
-- `departures` — plánované odjezdy ze zastávky pro datum a časové okno.
+- `departures` — odjezdová tabule zastávky (název nebo `stop_id`): nejbližší
+  odjezdy se směrem (konečnou), bez zadání dnes od teď na 3 hodiny dopředu.
 - `connections` — spojení mezi dvěma názvy zastávek, přímá i s přestupy
   (nejvýš `max_changes`, výchozí 3). Pro každý odjezd vrátí jen spojení, která
   nejsou horší v čase příjezdu i v počtu přestupů; každý úsek s linkou,
@@ -24,7 +25,8 @@ Dotazy jdou do SQLite indexu (`gtfs.sqlite`, ~330 MB), který se z GTFS souborů
 sestaví předem (`python -m jizdni_rady_mcp.index <gtfs-adresář> <výstup.sqlite>`,
 asi 1–2 minuty). Odjezdy pak trvají desítky milisekund, spojení po Praze pod
 sekundu a dálková 2–3 s. Docker image obsahuje jen tento index, GTFS soubory
-v něm nejsou.
+v něm nejsou. Každé volání nástroje (parametry, doba, případná chyba) se
+zapíše do logu kontejneru.
 
 Spojení hledá algoritmus Connection Scan nad úseky spojů seřazenými podle
 odjezdu. Přestup na stejné zastávce trvá nejméně 2 minuty, pěšky se přestupuje

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import functools
+import logging
 import os
 import sys
+import time
 import sqlite3
 import unicodedata
 from datetime import date, datetime
@@ -33,6 +36,26 @@ DATASET = Path(os.environ.get("GTFS_DATASET", "data/merged"))
 INSTALLED = Path(sys.prefix) / "share" / "jizdni-rady-cz-mcp" / "gtfs.sqlite"
 CACHED = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "jizdni-rady-cz-mcp" / "gtfs.sqlite"
 DATABASE = Path(os.environ["GTFS_DB"]) if os.environ.get("GTFS_DB") else INSTALLED if INSTALLED.is_file() else CACHED
+
+
+log = logging.getLogger("jizdni_rady_mcp")
+
+
+def _logged(tool):
+    """Log each tool call, how long it took and any error to stderr, which the
+    container log shows (mcp-proxy passes the server's stderr through)."""
+    @functools.wraps(tool)
+    def call(*args, **kwargs):
+        started = time.perf_counter()
+        try:
+            result = tool(*args, **kwargs)
+        except Exception as error:
+            log.warning("%s(%s) failed after %.2f s: %s", tool.__name__, kwargs or args,
+                        time.perf_counter() - started, error)
+            raise
+        log.info("%s(%s) %.2f s", tool.__name__, kwargs or args, time.perf_counter() - started)
+        return result
+    return call
 
 
 @lru_cache(maxsize=1)
@@ -152,6 +175,7 @@ def _resolve_stop(query: str) -> dict[str, str]:
 
 
 @mcp.tool()
+@_logged
 def dataset_summary() -> dict[str, Any]:
     """Vrátí základní informace o lokálně připojeném GTFS datasetu."""
     def count(table: str) -> int:
@@ -166,6 +190,7 @@ def dataset_summary() -> dict[str, Any]:
 
 
 @mcp.tool()
+@_logged
 def search_stops(query: str, limit: int = 10) -> list[dict[str, str]]:
     """Vyhledá zastávky podle části názvu a vrátí jejich ID a souřadnice."""
     needle = query.casefold().strip()
@@ -181,6 +206,7 @@ def search_stops(query: str, limit: int = 10) -> list[dict[str, str]]:
 
 
 @mcp.tool()
+@_logged
 def search_routes(query: str, route_type: int | None = None, limit: int = 20) -> list[dict[str, str]]:
     """Vyhledá linky podle čísla nebo názvu. GTFS route_type: autobus 3, vlak 2, tramvaj 0."""
     needle = query.casefold().strip()
@@ -195,56 +221,75 @@ def search_routes(query: str, route_type: int | None = None, limit: int = 20) ->
     return sorted(matches, key=lambda item: (item["route_short_name"], item["route_long_name"]))[:limit]
 
 
-def _trip_rows(rows, active: frozenset[str], limit: int) -> list[dict[str, str]]:
+def _start(day: date, from_time: str | None) -> int:
+    """from_time in seconds; without it now if the day is today, else midnight."""
+    if from_time:
+        return _seconds(from_time)
+    now = datetime.now(ZoneInfo("Europe/Prague"))
+    return now.hour * 3600 + now.minute * 60 if day == now.date() else 0
+
+
+def _stop_by_id_or_name(stop: str) -> dict[str, str]:
+    return _stop(stop.strip()) or _resolve_stop(stop)
+
+
+@mcp.tool()
+@_logged
+def departures(
+    stop: str,
+    service_date: str | None = None,
+    from_time: str | None = None,
+    to_time: str | None = None,
+    limit: int = 15,
+) -> dict[str, Any]:
+    """Odjezdová tabule jedné zastávky: nejbližší odjezdy linek a jejich směr.
+
+    stop je název zastávky, jak ho řekl uživatel („Drinopol“, „z Anděla“),
+    nebo stop_id ze search_stops. Bez service_date a from_time ukáže odjezdy
+    dnes od teď, bez to_time na 3 hodiny dopředu. direction je konečná spoje.
+    Na cestu z A do B použij connections, ne tento nástroj. Časy nad 24:00
+    jsou po půlnoci.
+    """
+    place = _stop_by_id_or_name(stop)
+    day = _requested_date(service_date)
+    start = _start(day, from_time)
+    end = _seconds(to_time) if to_time else start + 3 * 3600
+    if start > end:
+        raise ValueError("from_time musí být před to_time.")
+    limit = max(1, min(limit, 100))
+    active = _active_services(day)
+    rows = _db().execute(
+        """SELECT st.departure, t.trip_id, t.service_id, r.route_short_name, r.route_long_name,
+                  r.route_type,
+                  (SELECT s.stop_name FROM stop_times l JOIN stops s ON s.id = l.stop
+                   WHERE l.trip = st.trip ORDER BY l.stop_sequence DESC LIMIT 1) AS direction,
+                  (SELECT l.stop FROM stop_times l
+                   WHERE l.trip = st.trip ORDER BY l.stop_sequence DESC LIMIT 1) = st.stop AS terminates
+           FROM stop_times st JOIN trips t ON t.id = st.trip
+           LEFT JOIN routes r ON r.route_id = t.route_id
+           WHERE st.stop = (SELECT id FROM stops WHERE stop_id = ?) AND st.departure BETWEEN ? AND ?
+           ORDER BY st.departure""",
+        (place["stop_id"], start, end),
+    )
     found = []
     for row in rows:
-        if row["service_id"] not in active:
+        if row["service_id"] not in active or row["terminates"]:
             continue
         found.append({
             "departure_time": _clock(row["departure"]),
-            "arrival_time": _clock(row["arrival"]),
-            "route_id": row["route_id"],
             "route_short_name": row["route_short_name"] or "",
+            "mode": _MODES.get(row["route_type"], row["route_type"] or ""),
+            "direction": row["direction"],
             "route_long_name": row["route_long_name"] or "",
             "trip_id": row["trip_id"],
         })
         if len(found) == limit:
             break
-    return found
-
-
-@mcp.tool()
-def departures(
-    stop_id: str,
-    service_date: str | None = None,
-    from_time: str | None = None,
-    to_time: str = "23:59:59",
-    limit: int = 30,
-) -> list[dict[str, str]]:
-    """Odjezdová tabule jedné zastávky: odjezdy linek pro datum a časové okno.
-
-    Neříká, kudy a kam spoj jede, takže se nehodí k hledání cesty z A do B;
-    na to slouží connections. stop_id získáš ze search_stops. Časy GTFS mohou
-    přesáhnout 24:00.
-    """
-    day = _requested_date(service_date)
-    start = _seconds(from_time) if from_time else 0
-    end = _seconds(to_time)
-    if start > end:
-        raise ValueError("from_time musí být před to_time.")
-    if _stop(stop_id) is None:
-        raise ValueError(f"Neznámé stop_id: {stop_id}")
-    limit = max(1, min(limit, 100))
-    rows = _db().execute(
-        """SELECT st.departure, st.arrival, t.trip_id, t.route_id, t.service_id,
-                  r.route_short_name, r.route_long_name
-           FROM stop_times st JOIN trips t ON t.id = st.trip
-           LEFT JOIN routes r ON r.route_id = t.route_id
-           WHERE st.stop = (SELECT id FROM stops WHERE stop_id = ?) AND st.departure BETWEEN ? AND ?
-           ORDER BY st.departure""",
-        (stop_id, start, end),
-    )
-    return _trip_rows(rows, _active_services(day), limit)
+    return {
+        "stop": {key: place.get(key, "") for key in ("stop_id", "stop_name")},
+        "service_date": day.isoformat(),
+        "departures": found,
+    }
 
 
 @lru_cache(maxsize=4)
@@ -317,6 +362,7 @@ _MODES = {"0": "tramvaj", "1": "metro", "2": "vlak", "3": "autobus", "4": "pří
 
 
 @mcp.tool()
+@_logged
 def connections(
     from_stop: str,
     to_stop: str,
@@ -341,14 +387,8 @@ def connections(
     origin, destination = _resolve_stop(from_stop), _resolve_stop(to_stop)
     if origin["stop_id"] == destination["stop_id"]:
         raise ValueError("Výchozí a cílová zastávka jsou stejné.")
-    now = datetime.now(ZoneInfo("Europe/Prague"))
     day = _requested_date(service_date)
-    if from_time:
-        start = _seconds(from_time)
-    elif day == now.date():
-        start = now.hour * 3600 + now.minute * 60
-    else:
-        start = 0
+    start = _start(day, from_time)
     limit = max(1, min(limit, 10))
     max_rides = max(0, min(max_changes, 4)) + 1
     active, footpaths = _active_trips(day), _footpaths()
@@ -398,6 +438,8 @@ _SEARCH_WINDOW = 4 * 3600   # s after from_time in which departures are looked f
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     mcp.run(transport="stdio")
 
 
