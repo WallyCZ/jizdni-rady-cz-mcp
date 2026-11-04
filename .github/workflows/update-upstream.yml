@@ -1,13 +1,13 @@
-# Každé úterý posune submodul upstream (tangero/jizdni-rady-czech-republic)
+# Každý den posune submodul upstream (tangero/jizdni-rady-czech-republic)
 # na nejnovější commit jeho main. Když se změnil, commitne to a spustí
 # sestavení image (push z GITHUB_TOKEN jiné workflow nespouští,
-# workflow_dispatch ano).
+# workflow_dispatch ano). Beze změny v upstreamu nedělá nic.
 
 name: Aktualizace upstream
 
 on:
   schedule:
-    - cron: '0 6 * * 2'  # úterý 06:00 UTC, den po aktualizaci dat v upstreamu
+    - cron: '17 5 * * *'  # denně 05:17 UTC (upstream data obnovuje v pondělí 04:00 UTC)
   workflow_dispatch:
 
 permissions:

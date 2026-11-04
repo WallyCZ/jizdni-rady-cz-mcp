@@ -45,7 +45,7 @@ git submodule update --init
 ```
 
 Na nejnovější data z upstreamu se submodul posune příkazem
-`git submodule update --remote upstream` (v GitHub Actions to dělá každé úterý
+`git submodule update --remote upstream` (v GitHub Actions to dělá každý den
 workflow `update-upstream.yml`).
 
 ## Hotový image (GitHub Packages)
