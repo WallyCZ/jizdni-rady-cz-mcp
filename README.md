@@ -134,4 +134,6 @@ python -m venv .venv
 
 s proměnnou prostředí `GTFS_DATASET=upstream/data/merged`. Index se sestaví při
 prvním dotazu do `~/.cache/jizdni-rady-cz-mcp/gtfs.sqlite` (jinou cestu určí
-`GTFS_DB`) a znovu, když jsou data novější než index.
+`GTFS_DB`) a znovu, když jsou data novější než index. Docker image má index
+v `/usr/local/share/jizdni-rady-cz-mcp/gtfs.sqlite`, kde ho server najde i bez
+proměnných prostředí (`mcp-proxy` spouští server s prázdným prostředím).

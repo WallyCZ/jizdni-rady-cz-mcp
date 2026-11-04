@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import sqlite3
 import unicodedata
 from datetime import date, datetime
@@ -18,18 +19,24 @@ from .index import build
 
 mcp = FastMCP("Jízdní řády ČR")
 DATASET = Path(os.environ.get("GTFS_DATASET", "data/merged"))
-# The Docker image ships the index built from the dataset (GTFS_DB); outside it
-# the index is built on first use into the user's cache directory.
-DATABASE = Path(os.environ.get("GTFS_DB") or Path(
-    os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "jizdni-rady-cz-mcp" / "gtfs.sqlite")
+# The index: GTFS_DB, else the one installed beside the package (the Docker
+# image puts it there, so it is found even when a launcher such as mcp-proxy
+# starts the server with an empty environment), else one built on first use
+# into the user's cache directory.
+INSTALLED = Path(sys.prefix) / "share" / "jizdni-rady-cz-mcp" / "gtfs.sqlite"
+CACHED = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "jizdni-rady-cz-mcp" / "gtfs.sqlite"
+DATABASE = Path(os.environ["GTFS_DB"]) if os.environ.get("GTFS_DB") else INSTALLED if INSTALLED.is_file() else CACHED
 
 
 @lru_cache(maxsize=1)
 def _db() -> sqlite3.Connection:
-    source = DATASET / "stop_times.txt.gz"
-    stale = DATABASE.is_file() and source.is_file() and source.stat().st_mtime > DATABASE.stat().st_mtime
-    if not DATABASE.is_file() or (stale and "GTFS_DB" not in os.environ):
-        build(DATASET, DATABASE)
+    if DATABASE == CACHED:
+        source = DATASET / "stop_times.txt.gz"
+        stale = DATABASE.is_file() and source.is_file() and source.stat().st_mtime > DATABASE.stat().st_mtime
+        if not DATABASE.is_file() or stale:
+            build(DATASET, DATABASE)
+    elif not DATABASE.is_file():
+        raise FileNotFoundError(f"Index jízdních řádů nenalezen: {DATABASE}")
     db = sqlite3.connect(f"{DATABASE.resolve().as_uri()}?mode=ro&immutable=1", uri=True, check_same_thread=False)
     db.row_factory = sqlite3.Row
     return db

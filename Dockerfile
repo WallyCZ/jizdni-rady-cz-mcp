@@ -13,8 +13,7 @@ RUN PYTHONPATH=src python -m jizdni_rady_mcp.index data /build/gtfs.sqlite
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    GTFS_DB=/app/gtfs.sqlite
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
@@ -26,7 +25,9 @@ COPY src ./src
 RUN pip install --no-cache-dir . "mcp-proxy==0.12.0"
 
 # Only the index goes into the image, not the GTFS files it was built from.
-COPY --from=index /build/gtfs.sqlite /app/gtfs.sqlite
+# The server finds it there without any environment variable: mcp-proxy
+# starts it with an empty environment.
+COPY --from=index /build/gtfs.sqlite /usr/local/share/jizdni-rady-cz-mcp/gtfs.sqlite
 
 USER app
 
