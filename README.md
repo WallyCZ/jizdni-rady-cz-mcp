@@ -21,7 +21,7 @@ proto může trvat několik sekund podle disku a velikosti časového okna.
 ## Získání zdrojů
 
 ```powershell
-git clone --recursive <url-tohoto-repozitáře>
+git clone --recursive https://github.com/WallyCZ/jizdni-rady-cz-mcp.git
 # nebo v existujícím klonu:
 git submodule update --init
 ```
@@ -34,10 +34,10 @@ workflow `update-upstream.yml`).
 
 Workflow `docker.yml` při každém pushi do `main` sestaví image pro
 `linux/amd64` i `linux/arm64` a publikuje ho jako
-`ghcr.io/wallycz/jizdni-rady-cz:latest` (a `sha-<commit>`; tag `v1.2.3` přidá `1.2.3`).
+`ghcr.io/wallycz/jizdni-rady-cz-mcp:latest` (a `sha-<commit>`; tag `v1.2.3` přidá `1.2.3`).
 
 ```powershell
-docker run --rm -i ghcr.io/wallycz/jizdni-rady-cz:latest
+docker run --rm -i ghcr.io/wallycz/jizdni-rady-cz-mcp:latest
 ```
 
 ## Docker
@@ -58,7 +58,7 @@ docker compose --profile stdio run --rm -i mcp
 
 Novější image stáhne `docker compose pull`. Lokálně sestavený image použije
 Compose, když ho označíte stejným jménem
-(`docker build -t ghcr.io/wallycz/jizdni-rady-cz:latest .`).
+(`docker build -t ghcr.io/wallycz/jizdni-rady-cz-mcp:latest .`).
 
 ## Home Assistant
 

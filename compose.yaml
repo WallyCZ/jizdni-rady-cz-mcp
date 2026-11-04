@@ -1,9 +1,9 @@
 # Image sestavuje GitHub Actions (.github/workflows/docker.yml) a publikuje
 # na ghcr.io (veřejný balíček, přihlášení není potřeba).
-# Lokálně sestavený image: docker build -t ghcr.io/wallycz/jizdni-rady-cz:latest .
+# Lokálně sestavený image: docker build -t ghcr.io/wallycz/jizdni-rady-cz-mcp:latest .
 
 x-image: &image
-  image: ghcr.io/wallycz/jizdni-rady-cz:${IMAGE_TAG:-latest}
+  image: ghcr.io/wallycz/jizdni-rady-cz-mcp:${IMAGE_TAG:-latest}
   pull_policy: missing
 
 services:
