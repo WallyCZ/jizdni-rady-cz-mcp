@@ -15,8 +15,10 @@ přes standardní vstup/výstup, proto nemá ani nepotřebuje síťový port.
   dnešní datum i běžné české pádové tvary názvů.
 
 `departures` respektuje běžný GTFS kalendář i výjimky (`calendar_dates.txt`).
-Načítá komprimované `stop_times.txt.gz` průběžně; první a každý další dotaz
-proto může trvat několik sekund podle disku a velikosti časového okna.
+Dotazy jdou do SQLite indexu (`gtfs.sqlite`, ~220 MB), který se z GTFS souborů
+sestaví předem (`python -m jizdni_rady_mcp.index <gtfs-adresář> <výstup.sqlite>`,
+asi minutu). Odjezdy i přímé spoje pak trvají desítky milisekund. Docker image
+obsahuje jen tento index, GTFS soubory v něm nejsou.
 
 ## Získání zdrojů
 
@@ -114,4 +116,6 @@ python -m venv .venv
 .venv\Scripts\jizdni-rady-cz-mcp
 ```
 
-s proměnnou prostředí `GTFS_DATASET=upstream/data/merged`.
+s proměnnou prostředí `GTFS_DATASET=upstream/data/merged`. Index se sestaví při
+prvním dotazu do `~/.cache/jizdni-rady-cz-mcp/gtfs.sqlite` (jinou cestu určí
+`GTFS_DB`) a znovu, když jsou data novější než index.

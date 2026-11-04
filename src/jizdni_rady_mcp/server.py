@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import csv
-import gzip
 import os
+import sqlite3
 import unicodedata
 from datetime import date, datetime
 from functools import lru_cache
@@ -14,61 +13,52 @@ from zoneinfo import ZoneInfo
 
 from mcp.server.fastmcp import FastMCP
 
+from .index import build
+
 mcp = FastMCP("Jízdní řády ČR")
 DATASET = Path(os.environ.get("GTFS_DATASET", "data/merged"))
-
-
-def _csv(name: str):
-    path = DATASET / name
-    if not path.is_file():
-        raise FileNotFoundError(f"GTFS soubor nenalezen: {path}")
-    return open(path, "r", encoding="utf-8-sig", newline="")
+# The Docker image ships the index built from the dataset (GTFS_DB); outside it
+# the index is built on first use into the user's cache directory.
+DATABASE = Path(os.environ.get("GTFS_DB") or Path(
+    os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "jizdni-rady-cz-mcp" / "gtfs.sqlite")
 
 
 @lru_cache(maxsize=1)
-def _stops() -> dict[str, dict[str, str]]:
-    with _csv("stops.txt") as file:
-        return {row["stop_id"]: row for row in csv.DictReader(file)}
+def _db() -> sqlite3.Connection:
+    source = DATASET / "stop_times.txt.gz"
+    stale = DATABASE.is_file() and source.is_file() and source.stat().st_mtime > DATABASE.stat().st_mtime
+    if not DATABASE.is_file() or (stale and "GTFS_DB" not in os.environ):
+        build(DATASET, DATABASE)
+    db = sqlite3.connect(f"{DATABASE.resolve().as_uri()}?mode=ro&immutable=1", uri=True, check_same_thread=False)
+    db.row_factory = sqlite3.Row
+    return db
 
 
-@lru_cache(maxsize=1)
-def _routes() -> dict[str, dict[str, str]]:
-    with _csv("routes.txt") as file:
-        return {row["route_id"]: row for row in csv.DictReader(file)}
+def _query(sql: str, *args: Any) -> list[sqlite3.Row]:
+    return _db().execute(sql, args).fetchall()
 
 
-@lru_cache(maxsize=1)
-def _trips() -> dict[str, dict[str, str]]:
-    with _csv("trips.txt") as file:
-        return {row["trip_id"]: row for row in csv.DictReader(file)}
+def _stop(stop_id: str) -> dict[str, str] | None:
+    rows = _query("SELECT * FROM stops WHERE stop_id = ?", stop_id)
+    return dict(rows[0]) if rows else None
 
 
-@lru_cache(maxsize=1)
-def _calendar() -> dict[str, dict[str, str]]:
-    with _csv("calendar.txt") as file:
-        return {row["service_id"]: row for row in csv.DictReader(file)}
+@lru_cache(maxsize=8)
+def _active_services(day: date) -> frozenset[str]:
+    """Services running on the day: the calendar, then calendar_dates' exceptions."""
+    key, weekday = day.strftime("%Y%m%d"), day.weekday() + 1
+    active = {row[0] for row in _query(
+        "SELECT service_id FROM calendar WHERE start_date <= ? AND ? <= end_date AND substr(days, ?, 1) = '1'",
+        key, key, weekday)}
+    for service_id, exception in _query("SELECT service_id, exception_type FROM calendar_dates WHERE date = ?", key):
+        (active.add if exception == 1 else active.discard)(service_id)
+    return frozenset(active)
 
 
-@lru_cache(maxsize=32)
-def _exceptions(yyyymmdd: str) -> dict[str, str]:
-    """Read only exceptions for a requested day; avoids retaining all dates."""
-    with _csv("calendar_dates.txt") as file:
-        return {
-            row["service_id"]: row["exception_type"]
-            for row in csv.DictReader(file)
-            if row["date"] == yyyymmdd
-        }
-
-
-def _service_active(service_id: str, day: date) -> bool:
-    day_key = day.strftime("%Y%m%d")
-    exception = _exceptions(day_key).get(service_id)
-    if exception is not None:
-        return exception == "1"
-    service = _calendar().get(service_id)
-    if service is None or not (service["start_date"] <= day_key <= service["end_date"]):
-        return False
-    return service[("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")[day.weekday()]] == "1"
+def _clock(seconds: int | None) -> str:
+    if seconds is None:
+        return ""
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
 def _date(value: str) -> date:
@@ -112,13 +102,23 @@ def _normalized(value: str) -> str:
     )
 
 
+_PREPOSITIONS = {"z", "ze", "do", "na", "od", "k", "ke", "u", "v", "ve", "pres"}
+
+
 def _stop_tokens(value: str) -> set[str]:
     """Normalise common Czech word endings so Radlické matches Radlická."""
     vowels = "aeiouy"
     tokens = []
     for token in _normalized(value).replace(",", " ").split():
+        if token in _PREPOSITIONS:
+            continue
         tokens.append(token.rstrip(vowels) if len(token) > 4 else token)
     return set(tokens)
+
+
+@lru_cache(maxsize=1)
+def _stop_index() -> list[tuple[dict[str, str], set[str]]]:
+    return [(dict(row), _stop_tokens(row["stop_name"])) for row in _query("SELECT * FROM stops")]
 
 
 def _resolve_stop(query: str) -> dict[str, str]:
@@ -126,9 +126,8 @@ def _resolve_stop(query: str) -> dict[str, str]:
     if not query_tokens:
         raise ValueError("Název zastávky nesmí být prázdný.")
     candidates = []
-    for stop in _stops().values():
-        name = stop.get("stop_name", "")
-        name_tokens = _stop_tokens(name)
+    for stop, name_tokens in _stop_index():
+        name = stop["stop_name"]
         if query_tokens <= name_tokens:
             exact = _normalized(query) == _normalized(name)
             candidates.append((not exact, len(name), name, stop))
@@ -140,12 +139,14 @@ def _resolve_stop(query: str) -> dict[str, str]:
 @mcp.tool()
 def dataset_summary() -> dict[str, Any]:
     """Vrátí základní informace o lokálně připojeném GTFS datasetu."""
+    def count(table: str) -> int:
+        return _query(f"SELECT count(*) FROM {table}")[0][0]
     return {
-        "dataset": str(DATASET),
-        "stops": len(_stops()),
-        "routes": len(_routes()),
-        "trips": len(_trips()),
-        "stop_times_compressed_bytes": (DATASET / "stop_times.txt.gz").stat().st_size,
+        "index": str(DATABASE),
+        "stops": count("stops"),
+        "routes": count("routes"),
+        "trips": count("trips"),
+        "stop_times": count("stop_times"),
     }
 
 
@@ -157,9 +158,9 @@ def search_stops(query: str, limit: int = 10) -> list[dict[str, str]]:
         raise ValueError("Vyhledávací dotaz nesmí být prázdný.")
     limit = max(1, min(limit, 50))
     matches = [
-        {key: row.get(key, "") for key in ("stop_id", "stop_name", "stop_lat", "stop_lon")}
-        for row in _stops().values()
-        if needle in row.get("stop_name", "").casefold()
+        {key: stop.get(key, "") for key in ("stop_id", "stop_name", "stop_lat", "stop_lon")}
+        for stop, _ in _stop_index()
+        if needle in stop["stop_name"].casefold()
     ]
     return sorted(matches, key=lambda item: item["stop_name"])[:limit]
 
@@ -172,11 +173,29 @@ def search_routes(query: str, route_type: int | None = None, limit: int = 20) ->
         raise ValueError("Vyhledávací dotaz nesmí být prázdný.")
     limit = max(1, min(limit, 50))
     matches = []
-    for row in _routes().values():
-        searchable = " ".join((row.get("route_short_name", ""), row.get("route_long_name", ""))).casefold()
-        if needle in searchable and (route_type is None or row.get("route_type") == str(route_type)):
-            matches.append({key: row.get(key, "") for key in ("route_id", "route_short_name", "route_long_name", "route_type", "agency_id")})
+    for row in _query("SELECT route_id, route_short_name, route_long_name, route_type, agency_id FROM routes"):
+        searchable = " ".join((row["route_short_name"], row["route_long_name"])).casefold()
+        if needle in searchable and (route_type is None or row["route_type"] == str(route_type)):
+            matches.append(dict(row))
     return sorted(matches, key=lambda item: (item["route_short_name"], item["route_long_name"]))[:limit]
+
+
+def _trip_rows(rows, active: frozenset[str], limit: int) -> list[dict[str, str]]:
+    found = []
+    for row in rows:
+        if row["service_id"] not in active:
+            continue
+        found.append({
+            "departure_time": _clock(row["departure"]),
+            "arrival_time": _clock(row["arrival"]),
+            "route_id": row["route_id"],
+            "route_short_name": row["route_short_name"] or "",
+            "route_long_name": row["route_long_name"] or "",
+            "trip_id": row["trip_id"],
+        })
+        if len(found) == limit:
+            break
+    return found
 
 
 @mcp.tool()
@@ -196,33 +215,19 @@ def departures(
     end = _seconds(to_time)
     if start > end:
         raise ValueError("from_time musí být před to_time.")
-    if stop_id not in _stops():
+    if _stop(stop_id) is None:
         raise ValueError(f"Neznámé stop_id: {stop_id}")
     limit = max(1, min(limit, 100))
-    found: list[dict[str, str]] = []
-    stop_times = DATASET / "stop_times.txt.gz"
-    if not stop_times.is_file():
-        raise FileNotFoundError(f"GTFS soubor nenalezen: {stop_times}")
-    with gzip.open(stop_times, "rt", encoding="utf-8-sig", newline="") as file:
-        for row in csv.DictReader(file):
-            if row.get("stop_id") != stop_id:
-                continue
-            departure = row.get("departure_time", "")
-            if not departure or not start <= _seconds(departure) <= end:
-                continue
-            trip = _trips().get(row["trip_id"])
-            if trip is None or not _service_active(trip["service_id"], day):
-                continue
-            route = _routes().get(trip["route_id"], {})
-            found.append({
-                "departure_time": departure,
-                "arrival_time": row.get("arrival_time", ""),
-                "route_id": trip["route_id"],
-                "route_short_name": route.get("route_short_name", ""),
-                "route_long_name": route.get("route_long_name", ""),
-                "trip_id": row["trip_id"],
-            })
-    return sorted(found, key=lambda item: item["departure_time"])[:limit]
+    rows = _db().execute(
+        """SELECT st.departure, st.arrival, t.trip_id, t.route_id, t.service_id,
+                  r.route_short_name, r.route_long_name
+           FROM stop_times st JOIN trips t ON t.id = st.trip
+           LEFT JOIN routes r ON r.route_id = t.route_id
+           WHERE st.stop = (SELECT id FROM stops WHERE stop_id = ?) AND st.departure BETWEEN ? AND ?
+           ORDER BY st.departure""",
+        (stop_id, start, end),
+    )
+    return _trip_rows(rows, _active_services(day), limit)
 
 
 @mcp.tool()
@@ -243,35 +248,23 @@ def direct_connections(
     day = _requested_date(service_date)
     start = _seconds(from_time) if from_time else 0
     limit = max(1, min(limit, 30))
-    pending: dict[str, dict[str, str]] = {}
-    connections: list[dict[str, str]] = []
-    with gzip.open(DATASET / "stop_times.txt.gz", "rt", encoding="utf-8-sig", newline="") as file:
-        for row in csv.DictReader(file):
-            trip_id = row.get("trip_id", "")
-            if row.get("stop_id") == origin["stop_id"]:
-                departure = row.get("departure_time", "")
-                trip = _trips().get(trip_id)
-                if departure and _seconds(departure) >= start and trip and _service_active(trip["service_id"], day):
-                    pending[trip_id] = row
-            elif row.get("stop_id") == destination["stop_id"] and trip_id in pending:
-                origin_row = pending.pop(trip_id)
-                if int(row.get("stop_sequence", "0")) <= int(origin_row.get("stop_sequence", "0")):
-                    continue
-                trip = _trips()[trip_id]
-                route = _routes().get(trip["route_id"], {})
-                connections.append({
-                    "departure_time": origin_row.get("departure_time", ""),
-                    "arrival_time": row.get("arrival_time", ""),
-                    "route_id": trip["route_id"],
-                    "route_short_name": route.get("route_short_name", ""),
-                    "route_long_name": route.get("route_long_name", ""),
-                    "trip_id": trip_id,
-                })
+    rows = _db().execute(
+        """SELECT a.departure, b.arrival, t.trip_id, t.route_id, t.service_id,
+                  r.route_short_name, r.route_long_name
+           FROM stop_times a
+           JOIN stop_times b ON b.trip = a.trip AND b.stop_sequence > a.stop_sequence
+                            AND b.stop = (SELECT id FROM stops WHERE stop_id = ?)
+           JOIN trips t ON t.id = a.trip
+           LEFT JOIN routes r ON r.route_id = t.route_id
+           WHERE a.stop = (SELECT id FROM stops WHERE stop_id = ?) AND a.departure >= ?
+           ORDER BY a.departure""",
+        (destination["stop_id"], origin["stop_id"], start),
+    )
     return {
         "origin": {key: origin.get(key, "") for key in ("stop_id", "stop_name")},
         "destination": {key: destination.get(key, "") for key in ("stop_id", "stop_name")},
         "service_date": day.isoformat(),
-        "connections": sorted(connections, key=lambda item: item["departure_time"])[:limit],
+        "connections": _trip_rows(rows, _active_services(day), limit),
     }
 
 
