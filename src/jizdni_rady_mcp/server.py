@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import bisect
 import functools
+import heapq
 import logging
+import math
 import os
 import sys
+import threading
 import time
 import sqlite3
 import unicodedata
@@ -17,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 from mcp.server.fastmcp import FastMCP
 
-from . import planner
+from . import planner, realtime
 from .index import build
 
 mcp = FastMCP(
@@ -159,6 +163,22 @@ def _stop_index() -> list[tuple[dict[str, str], set[str]]]:
     return [(dict(row), _stop_tokens(row["stop_name"])) for row in _query("SELECT * FROM stops")]
 
 
+def _town(name: str) -> str:
+    return name.split(",")[0].strip()
+
+
+def _resolve_stops(query: str) -> list[dict[str, str]]:
+    """The stop the query names; when it names a town ("do Větřkovic") and no
+    stop exactly, all the town's stops, so a search may arrive at any."""
+    stop = _resolve_stop(query)
+    if _normalized(stop["stop_name"]) == _normalized(query):
+        return [stop]
+    tokens = _stop_tokens(query)
+    town = [candidate for candidate, _ in _stop_index()
+            if "," in candidate["stop_name"] and _stop_tokens(_town(candidate["stop_name"])) == tokens]
+    return town or [stop]
+
+
 def _resolve_stop(query: str) -> dict[str, str]:
     query_tokens = _stop_tokens(query)
     if not query_tokens:
@@ -285,17 +305,15 @@ def departures(
         })
         if len(found) == limit:
             break
+    if _is_today(day):
+        board = realtime.boards({place["stop_name"]}, _REALTIME_BUDGET).get(place["stop_name"])
+        for item in found:
+            _add_delay(item, board, item["route_short_name"], item["departure_time"], item["direction"])
     return {
         "stop": {key: place.get(key, "") for key in ("stop_id", "stop_name")},
         "service_date": day.isoformat(),
         "departures": found,
     }
-
-
-@lru_cache(maxsize=4)
-def _active_trips(day: date) -> frozenset[int]:
-    active = _active_services(day)
-    return frozenset(trip for trip, service in _query("SELECT id, service_id FROM trips") if service in active)
 
 
 @lru_cache(maxsize=1)
@@ -306,8 +324,146 @@ def _footpaths() -> dict[int, list[tuple[int, int]]]:
     return paths
 
 
-def _stop_number(stop: dict[str, str]) -> int:
-    return _query("SELECT id FROM stops WHERE stop_id = ?", stop["stop_id"])[0][0]
+@lru_cache(maxsize=1)
+def _service_numbers() -> dict[str, int]:
+    return {service_id: number for number, service_id in _query("SELECT id, service_id FROM services")}
+
+
+@lru_cache(maxsize=1)
+def _coordinates() -> dict[int, tuple[float, float]]:
+    """Stop id -> (lat, lon) for the stops whose position the feed knows."""
+    points = {}
+    for stop, _ in _stop_index():
+        try:
+            lat, lon = float(stop["stop_lat"]), float(stop["stop_lon"])
+        except ValueError:
+            continue
+        if lat or lon:
+            points[stop["id"]] = (lat, lon)
+    return points
+
+
+def _km(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], (a[1] - b[1]) * 0.643) * 111.32   # cos 50 degrees
+
+
+# The planner's filters live in temporary tables of the shared connection:
+# the services running on the day it last planned for, and the stops near both
+# ends of the journey being planned. _planning serialises their use.
+_planning = threading.Lock()
+_planned_day: list[date] = []
+
+
+def _prepare(day: date) -> None:
+    db = _db()
+    if not _planned_day:
+        db.executescript("""
+            CREATE TEMP TABLE IF NOT EXISTS active_services (service INTEGER PRIMARY KEY);
+            CREATE TEMP TABLE IF NOT EXISTS near_origin (stop INTEGER PRIMARY KEY);
+            CREATE TEMP TABLE IF NOT EXISTS near_destination (stop INTEGER PRIMARY KEY);
+            CREATE TEMP TABLE IF NOT EXISTS corridor (stop INTEGER PRIMARY KEY);""")
+    if _planned_day[:1] != [day]:
+        numbers = _service_numbers()
+        db.execute("DELETE FROM temp.active_services")
+        db.executemany("INSERT INTO temp.active_services VALUES (?)",
+                       ((numbers[service],) for service in _active_services(day) if service in numbers))
+        _planned_day[:] = [day]
+
+
+def warm_up(service_date: str | None = None) -> None:
+    """Load what every journey search needs, so the first one is not slow."""
+    _stop_index()
+    _footpaths()
+    _coordinates()
+    with _planning:
+        _prepare(_requested_date(service_date))
+
+
+def _ends(stops: list[dict[str, str]]) -> tuple[tuple[float, float], float] | None:
+    """Centre and radius (km) of the stops' positions, or None if none is known."""
+    points = [_coordinates()[stop["id"]] for stop in stops if stop["id"] in _coordinates()]
+    if not points:
+        return None
+    centre = (sum(p[0] for p in points) / len(points), sum(p[1] for p in points) / len(points))
+    return centre, max(_km(centre, p) for p in points)
+
+
+def _hops(origins: list[dict[str, str]], destinations: list[dict[str, str]], start: int):
+    """The hops a search from start reads: the day's running trips. For a long
+    journey only long trips (rail, lines reaching 30+ km), but also local ones
+    near the origin during the first _LEAVE_ORIGIN seconds and near the
+    destination from the earliest arrival there at _TOP_SPEED_KMH on. Call with
+    _planning held."""
+    db = _db()
+    here, there = _ends(origins), _ends(destinations)
+    end = start + _HORIZON
+    gap = _km(here[0], there[0]) - here[1] - there[1] if here and there else 0
+    if gap >= _LONG_JOURNEY_KM:
+        points = _coordinates()
+        ellipse = gap + here[1] + there[1]
+        _fill("corridor", (
+            stop for stop, point in points.items()
+            if _km(point, here[0]) + _km(point, there[0]) <= _CORRIDOR * ellipse + _NEAR_KM))
+        _fill("corridor", (stop for stop, _ in _stop_index_ids() if stop not in points), clear=False)
+        _fill("near_origin", (stop for stop, point in points.items()
+                              if _km(point, here[0]) <= here[1] + _NEAR_KM))
+        _fill("near_destination", (stop for stop, point in points.items()
+                                   if _km(point, there[0]) <= there[1] + _NEAR_KM))
+        soonest = start + int((gap - 2 * _NEAR_KM) / _TOP_SPEED_KMH * 3600)
+        # Each stream comes in departure order: the merge reads them in step.
+        return heapq.merge(
+            _rows("""SELECT departure, trip, from_stop, to_stop, arrival, stop_sequence FROM hops_long
+                     WHERE departure BETWEEN :since AND :until AND from_stop IN temp.corridor
+                       AND service IN temp.active_services""", since=start, until=end),
+            _local("near_origin", start, min(end, start + _LEAVE_ORIGIN)),
+            _local("near_destination", max(start, soonest), end))
+    return _rows("""SELECT departure, trip, from_stop, to_stop, arrival, stop_sequence FROM hops
+                    WHERE departure BETWEEN :since AND :until AND service IN temp.active_services""",
+                 since=start, until=end)
+
+
+def _local(table: str, start: int, until: int):
+    """The local hops from the stops in table, in departure order. A city's
+    many stops are cheaper to filter while reading the hops in time order; a
+    few are cheaper to look up by stop, a slice of time at a time."""
+    if _db().execute(f"SELECT count(*) FROM temp.{table}").fetchone()[0] > _LOOKUP_STOPS:
+        # +from_stop keeps SQLite off the stop index: it reads the primary key,
+        # already in the order asked for, instead of sorting the rows by stop.
+        return _rows(f"""SELECT departure, trip, from_stop, to_stop, arrival, stop_sequence FROM hops
+                         WHERE departure BETWEEN :since AND :until AND NOT long
+                           AND +from_stop IN temp.{table} AND service IN temp.active_services
+                         ORDER BY departure, trip, stop_sequence""",
+                     since=start, until=until)
+    return _slices(f"""SELECT departure, trip, from_stop, to_stop, arrival, stop_sequence FROM hops
+                       WHERE NOT long AND from_stop IN temp.{table} AND departure BETWEEN :since AND :until
+                         AND service IN temp.active_services
+                       ORDER BY departure, trip, stop_sequence""", start, until)
+
+
+@lru_cache(maxsize=1)
+def _stop_index_ids() -> list[tuple[int, str]]:
+    return [(stop["id"], stop["stop_id"]) for stop, _ in _stop_index()]
+
+
+def _fill(table: str, stops, clear: bool = True) -> None:
+    db = _db()
+    if clear:
+        db.execute(f"DELETE FROM temp.{table}")
+    db.executemany(f"INSERT OR IGNORE INTO temp.{table} VALUES (?)", ((stop,) for stop in stops))
+
+
+def _slices(sql: str, start: int, end: int):
+    """sql's rows for departures start..end, read _SLICE seconds at a time: its
+    ORDER BY sorts one slice, and the slices after the search ends are never read."""
+    for since in range(start, end + 1, _SLICE):
+        yield from _rows(sql, since=since, until=min(end, since + _SLICE - 1))
+
+
+def _rows(sql: str, **names: int):
+    """Plain tuples from a cursor of its own: the planner reads ~10^5 of them."""
+    cursor = _db().cursor()
+    cursor.row_factory = None
+    return cursor.execute(sql, names)
 
 
 @lru_cache(maxsize=4096)
@@ -346,15 +502,54 @@ def _short(clock: str) -> str:
 
 
 def _summary(legs: list[dict[str, Any]]) -> str:
-    """The journey in one line: 14:02 tramvaj 22 z Praha, Drinopol do ... (14:31)."""
+    """The journey in one line: 14:02 tramvaj 22 z Praha, Drinopol do ... (14:31),
+    with the current delay of a ride where Golemio knows it."""
     parts = []
     for leg in legs:
         if leg["type"] == "walk":
             parts.append(f"pěšky {leg['minutes']} min na {leg['to_stop']}")
         else:
-            parts.append(f"{_short(leg['departure_time'])} {leg['mode']} {leg['route_short_name']} "
-                         f"z {leg['from_stop']} do {leg['to_stop']} ({_short(leg['arrival_time'])})")
+            parts.append(f"{_short(leg['departure_time'])}{_lateness(leg)} {leg['mode']} "
+                         f"{leg['route_short_name']} z {leg['from_stop']} do {leg['to_stop']} "
+                         f"({_short(leg['arrival_time'])})")
     return ", ".join(parts)
+
+
+def _lateness(item: dict[str, Any]) -> str:
+    if item.get("canceled"):
+        return " (zrušen)"
+    minutes = item.get("delay_minutes")
+    if minutes is None:
+        return ""
+    return " (včas)" if minutes <= 0 else f" (zpoždění {minutes} min)"
+
+
+def _is_today(day: date) -> bool:
+    return day == datetime.now(ZoneInfo("Europe/Prague")).date()
+
+
+def _add_delay(item: dict[str, Any], board, route: str, departure: str,
+               direction: str | None = None) -> None:
+    """Add the realtime fields of route's departure at departure to item, if known."""
+    found = realtime.delay(board, route, departure, direction)
+    if found:
+        item.update(found)
+
+
+def _add_delays(found: list[dict[str, Any]]) -> None:
+    """Current delays of the rides from Prague stops within the next few hours,
+    their boards fetched together, summaries rewritten with them."""
+    now = datetime.now(ZoneInfo("Europe/Prague"))
+    soon = now.hour * 3600 + now.minute * 60 + realtime.MINUTES_AHEAD * 60
+    rides = [leg for item in found for leg in item["legs"]
+             if leg["type"] == "ride" and _seconds(leg["departure_time"]) <= soon]
+    boards = realtime.boards({leg["from_stop"] for leg in rides}, _REALTIME_BUDGET)
+    if not boards:
+        return
+    for leg in rides:
+        _add_delay(leg, boards.get(leg["from_stop"]), leg["route_short_name"], leg["departure_time"])
+    for item in found:
+        item["summary"] = _summary(item["legs"])
 
 
 _MODES = {"0": "tramvaj", "1": "metro", "2": "vlak", "3": "autobus", "4": "přívoz",
@@ -368,8 +563,8 @@ def connections(
     to_stop: str,
     service_date: str | None = None,
     from_time: str | None = None,
-    max_changes: int = 3,
-    limit: int = 5,
+    max_changes: int = 4,
+    limit: int = 3,
 ) -> dict[str, Any]:
     """Vyhledá spojení z jedné zastávky do druhé, přímá i s přestupy. Použij ho na
     každý dotaz typu „jak se dostanu z A do B“, „najdi spojení“, „kdy mi to jede“.
@@ -384,63 +579,141 @@ def connections(
     řádu včetně návazností, takže ho uživateli podej tak, jak je; neskládej
     spojení sám z departures. Časy nad 24:00 jsou po půlnoci.
     """
-    origin, destination = _resolve_stop(from_stop), _resolve_stop(to_stop)
-    if origin["stop_id"] == destination["stop_id"]:
+    origins, destinations = _resolve_stops(from_stop), _resolve_stops(to_stop)
+    origin_ids = {stop["id"] for stop in origins}
+    destination_ids = {stop["id"] for stop in destinations}
+    if origin_ids & destination_ids:
         raise ValueError("Výchozí a cílová zastávka jsou stejné.")
     day = _requested_date(service_date)
     start = _start(day, from_time)
     limit = max(1, min(limit, 10))
     max_rides = max(0, min(max_changes, 4)) + 1
-    active, footpaths = _active_trips(day), _footpaths()
-    origin_id, destination_id = _stop_number(origin), _stop_number(destination)
+    footpaths = _footpaths()
+    started = time.monotonic()
+    deadline = started + _TIME_BUDGET
 
     found: list[dict[str, Any]] = []
     seen: set[tuple] = set()
+    partial = False
     search_from, last = start, start + _SEARCH_WINDOW
-    while len(found) < limit and search_from <= last:
-        journeys = planner.earliest(
-            _db(), active, footpaths, origin_id, destination_id, search_from,
-            max_rides, _CHANGE_TIME, _HORIZON)
-        if not journeys:
-            break
-        first_departures = []
-        for arrival, legs in journeys:
-            rides = [leg for leg in legs if isinstance(leg, planner.Ride)]
-            lead = legs[0].seconds if isinstance(legs[0], planner.Walk) else 0
-            departure = rides[0].departure - lead
-            first_departures.append(rides[0].departure)
-            key = tuple((leg.trip, leg.board_stop, leg.alight_stop) for leg in rides)
-            if key in seen:
-                continue
-            seen.add(key)
-            described = [_leg(leg) for leg in legs]
-            found.append({
-                "departure_time": _clock(departure),
-                "arrival_time": _clock(arrival),
-                "duration_minutes": round((arrival - departure) / 60),
-                "changes": len(rides) - 1,
-                "summary": _summary(described),
-                "legs": described,
-            })
-        search_from = min(first_departures) + 60
+    with _planning:
+        _prepare(day)
+        hops = _Replay(_hops(origins, destinations, start))
+        while len(found) < limit and search_from <= last:
+            journeys, complete = planner.earliest(
+                hops.since(search_from), footpaths, origin_ids, destination_ids,
+                search_from, max_rides, _CHANGE_TIME, deadline)
+            search_from = _collect(journeys, found, seen, search_from)
+            if not journeys:
+                partial = not complete
+                break
+            if not complete or time.monotonic() > min(deadline, started + _MORE_BUDGET):
+                partial = len(found) < limit
+                break
     found.sort(key=lambda item: (item["departure_time"], item["arrival_time"]))
-    return {
-        "origin": {key: origin.get(key, "") for key in ("stop_id", "stop_name")},
-        "destination": {key: destination.get(key, "") for key in ("stop_id", "stop_name")},
+    del found[limit:]
+    if _is_today(day):
+        _add_delays(found)
+    result = {
+        "origin": _place(origins),
+        "destination": _place(destinations),
         "service_date": day.isoformat(),
-        "connections": found[:limit],
+        "connections": found,
     }
+    if partial:
+        result["partial"] = True
+    return result
+
+
+class _Replay:
+    """Hops read once and kept: the searches for later departures go through
+    the same ones again from their own start instead of querying anew."""
+
+    def __init__(self, rows):
+        self._rows = iter(rows)
+        self._kept: list[tuple[int, int, int, int, int]] = []
+
+    def since(self, start: int):
+        index = bisect.bisect_left(self._kept, start, key=lambda row: row[0])
+        while index < len(self._kept):
+            yield self._kept[index]
+            index += 1
+        for row in self._rows:
+            self._kept.append(row)
+            if row[0] >= start:
+                yield row
+
+
+def _collect(journeys, found: list[dict[str, Any]], seen: set[tuple], search_from: int) -> int:
+    """Add the journeys not found yet; the next search starts a minute after
+    the earliest first ride among them."""
+    if not journeys:
+        return search_from
+    first_departures = []
+    for arrival, legs in journeys:
+        rides = [leg for leg in legs if isinstance(leg, planner.Ride)]
+        lead = legs[0].seconds if isinstance(legs[0], planner.Walk) else 0
+        departure = rides[0].departure - lead
+        first_departures.append(rides[0].departure)
+        key = tuple((leg.trip, leg.board_stop, leg.alight_stop) for leg in rides)
+        if key in seen:
+            continue
+        seen.add(key)
+        described = [_leg(leg) for leg in legs]
+        found.append({
+            "departure_time": _clock(departure),
+            "arrival_time": _clock(arrival),
+            "duration_minutes": round((arrival - departure) / 60),
+            "changes": len(rides) - 1,
+            "summary": _summary(described),
+            "legs": described,
+        })
+    # A later departure arriving as early with no more changes makes an
+    # earlier one pointless: the same train, caught by a later tram.
+    found[:] = [item for item in found if not any(
+        other is not item and other["departure_time"] >= item["departure_time"]
+        and other["arrival_time"] <= item["arrival_time"] and other["changes"] <= item["changes"]
+        for other in found)]
+    return min(first_departures) + 60
+
+
+def _place(stops: list[dict[str, str]]) -> dict[str, str]:
+    """A resolved place: its stop, or for a whole town its first stop and the town."""
+    if len(stops) == 1:
+        return {key: stops[0].get(key, "") for key in ("stop_id", "stop_name")}
+    return {"stop_id": stops[0]["stop_id"], "stop_name": _town(stops[0]["stop_name"])}
 
 
 _CHANGE_TIME = 120          # s to change between trips at the same stop
-_HORIZON = 6 * 3600         # s, the longest journey looked for
+_HORIZON = 12 * 3600        # s, the longest journey looked for
 _SEARCH_WINDOW = 4 * 3600   # s after from_time in which departures are looked for
+_TIME_BUDGET = 7.0          # s a search may take; then it returns what it has
+_MORE_BUDGET = 1.5          # s after which it looks for no more connections
+_REALTIME_BUDGET = 2.0      # s to wait for Golemio's departure boards
+_LONG_JOURNEY_KM = 40       # beyond this the middle of a journey is long trips only
+_NEAR_KM = 20               # around each end local trips count too
+_LEAVE_ORIGIN = 90 * 60     # s in which a long journey leaves its origin's area
+_TOP_SPEED_KMH = 160        # no journey covers the distance faster
+_SLICE = 30 * 60            # s of local departures looked up by stop at a time
+_LOOKUP_STOPS = 500         # up to this many stops near an end are looked up by stop
+_CORRIDOR = 1.3             # a long journey's trips run within this ellipse
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    threading.Thread(target=_warm_up_logged, daemon=True).start()
     mcp.run(transport="stdio")
+
+
+def _warm_up_logged() -> None:
+    started = time.perf_counter()
+    try:
+        warm_up()
+    except Exception:
+        log.exception("warm-up failed")
+        return
+    log.info("warm-up %.2f s", time.perf_counter() - started)
 
 
 if __name__ == "__main__":

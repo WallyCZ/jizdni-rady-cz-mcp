@@ -32,11 +32,21 @@ CREATE TABLE calendar_dates (service_id TEXT, date TEXT, exception_type INTEGER)
 CREATE TABLE stop_times (trip INTEGER, stop_sequence INTEGER, stop INTEGER,
                          arrival INTEGER, departure INTEGER,
                          PRIMARY KEY (trip, stop_sequence)) WITHOUT ROWID;
+-- Integer ids of the services, so the hops can carry their trip's.
+CREATE TABLE services (id INTEGER PRIMARY KEY, service_id TEXT UNIQUE);
 -- A trip's hop from from_stop to the next stop, keyed by departure so the
--- planner reads them in time order without a separate index.
+-- planner reads them in time order without a separate index. service lets
+-- SQLite skip the trips not running that day; long marks trips that matter
+-- away from both ends of a long journey (rail, or a line reaching 30+ km).
 CREATE TABLE hops (departure INTEGER, trip INTEGER, stop_sequence INTEGER,
                    from_stop INTEGER, to_stop INTEGER, arrival INTEGER,
+                   service INTEGER, long INTEGER,
                    PRIMARY KEY (departure, trip, stop_sequence)) WITHOUT ROWID;
+-- The long hops again, so a long journey's search reads only them away from
+-- its two ends.
+CREATE TABLE hops_long (departure INTEGER, trip INTEGER, stop_sequence INTEGER,
+                        from_stop INTEGER, to_stop INTEGER, arrival INTEGER, service INTEGER,
+                        PRIMARY KEY (departure, trip, stop_sequence)) WITHOUT ROWID;
 CREATE TABLE footpaths (from_stop INTEGER, to_stop INTEGER, seconds INTEGER,
                         PRIMARY KEY (from_stop, to_stop)) WITHOUT ROWID;
 """
@@ -46,10 +56,13 @@ WALK_SPEED = 1.0        # m/s along the straight line; streets are not straight
 MIN_WALK = 120          # s, the shortest change between two stops
 MAX_SPEED_KMH = 200     # faster between two stops is a merged stop, not a ride
 MIN_LEAP_KM = 2
+LONG_TRIP_KM = 30       # a line whose stops span this far serves long journeys
 
 INDEXES = """
 CREATE INDEX stop_times_stop ON stop_times (stop, departure);
 CREATE INDEX calendar_dates_date ON calendar_dates (date);
+-- The local hops by stop: a long journey reads those near its two ends.
+CREATE INDEX hops_local_stop ON hops (from_stop, departure) WHERE NOT long;
 """
 
 DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
@@ -136,14 +149,31 @@ def build(directory: Path, output: Path) -> None:
          ((trips[r["trip_id"]], stops[r["stop_id"]], int(r["stop_sequence"]),
            _seconds(r.get("arrival_time", "")), _seconds(r.get("departure_time", "")))
           for r in _rows(directory, "stop_times.txt")))
+    db.execute("INSERT INTO services (service_id) SELECT DISTINCT service_id FROM trips")
+    # A trip is long when it is rail or its stops span LONG_TRIP_KM or more.
+    db.execute(f"""
+        CREATE TEMP TABLE trip_info AS
+        SELECT t.id AS trip, v.id AS service,
+               (r.route_type = '2' OR
+                ((max(s.stop_lat) - min(s.stop_lat)) * 111.32) * ((max(s.stop_lat) - min(s.stop_lat)) * 111.32) +
+                ((max(s.stop_lon) - min(s.stop_lon)) * 71.6) * ((max(s.stop_lon) - min(s.stop_lon)) * 71.6)
+                >= {LONG_TRIP_KM ** 2}) AS long
+        FROM trips t JOIN services v ON v.service_id = t.service_id
+        LEFT JOIN routes r ON r.route_id = t.route_id
+        JOIN stop_times st ON st.trip = t.id
+        LEFT JOIN stops s ON s.id = st.stop AND s.stop_lat + 0 != 0
+        GROUP BY t.id""")
+    db.execute("CREATE INDEX temp.trip_info_trip ON trip_info (trip)")
     db.execute("""
         INSERT INTO hops
-        SELECT departure, trip, stop_sequence, stop, next_stop, next_arrival FROM (
-            SELECT trip, stop_sequence, stop, departure,
-                   lead(stop) OVER w AS next_stop, lead(arrival) OVER w AS next_arrival
-            FROM stop_times WINDOW w AS (PARTITION BY trip ORDER BY stop_sequence))
-        WHERE next_stop IS NOT NULL AND departure IS NOT NULL AND next_arrival IS NOT NULL
-        ORDER BY departure, trip, stop_sequence""")
+        SELECT h.departure, h.trip, h.stop_sequence, h.stop, h.next_stop, h.next_arrival,
+               i.service, coalesce(i.long, 0)
+        FROM (SELECT trip, stop_sequence, stop, departure,
+                     lead(stop) OVER w AS next_stop, lead(arrival) OVER w AS next_arrival
+              FROM stop_times WINDOW w AS (PARTITION BY trip ORDER BY stop_sequence)) h
+        JOIN trip_info i ON i.trip = h.trip
+        WHERE h.next_stop IS NOT NULL AND h.departure IS NOT NULL AND h.next_arrival IS NOT NULL
+        ORDER BY h.departure, h.trip, h.stop_sequence""")
     # The feed merges places of the same name into one stop (Říčany near Prague
     # and near Brno), so a trip seems to leap across the country from it. Such
     # hops would let the planner change there between the two places.
@@ -158,6 +188,10 @@ def build(directory: Path, output: Path) -> None:
                         ({MAX_SPEED_KMH} / 3600.0 * max(h.arrival - h.departure, 60))
                         * ({MAX_SPEED_KMH} / 3600.0 * max(h.arrival - h.departure, 60))))""").rowcount
     print(f"Vyřazeno {dropped} úseků s nemožnou rychlostí", file=sys.stderr)
+    db.execute("""
+        INSERT INTO hops_long
+        SELECT departure, trip, stop_sequence, from_stop, to_stop, arrival, service
+        FROM hops WHERE long ORDER BY departure, trip, stop_sequence""")
     load("footpaths", ("from_stop", "to_stop", "seconds"),
          _footpaths(db.execute("SELECT id, stop_lat, stop_lon FROM stops").fetchall()))
     db.commit()

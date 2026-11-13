@@ -12,24 +12,50 @@ přes standardní vstup/výstup, proto nemá ani nepotřebuje síťový port.
 - `search_routes` — vyhledání linek podle čísla či názvu.
 - `departures` — odjezdová tabule zastávky (název nebo `stop_id`): nejbližší
   odjezdy se směrem (konečnou), bez zadání dnes od teď na 3 hodiny dopředu.
+  U pražských zastávek s aktuálním zpožděním (viz níže).
 - `connections` — spojení mezi dvěma názvy zastávek, přímá i s přestupy
-  (nejvýš `max_changes`, výchozí 3). Pro každý odjezd vrátí jen spojení, která
-  nejsou horší v čase příjezdu i v počtu přestupů; každý úsek s linkou,
-  druhem dopravy, časy a přestupy pěšky. Umí dnešní datum, aktuální čas
-  i běžné české pádové tvary názvů („z Drinopolu na Radlickou“).
+  (nejvýš `max_changes`, výchozí 4), výchozí 3 nejbližší. Vynechá spojení,
+  které je horší v odjezdu, příjezdu i počtu přestupů než jiné nalezené; každý
+  úsek s linkou, druhem dopravy, časy a přestupy pěšky. Umí dnešní datum,
+  aktuální čas i běžné české pádové tvary názvů („z Drinopolu na Radlickou“).
+  Název obce bez zastávky („do Větřkovic“) znamená kteroukoli její zastávku.
 
 Oba nástroje respektují GTFS kalendář i výjimky (`calendar_dates.txt`). Časy
 po půlnoci jsou podle GTFS větší než 24:00 (`24:03:00` je 0:03 dalšího dne).
 
-Dotazy jdou do SQLite indexu (`gtfs.sqlite`, ~330 MB), který se z GTFS souborů
+## Rychlost
+
+Dotazy jdou do SQLite indexu (`gtfs.sqlite`, ~430 MB), který se z GTFS souborů
 sestaví předem (`python -m jizdni_rady_mcp.index <gtfs-adresář> <výstup.sqlite>`,
-asi 1–2 minuty). Odjezdy pak trvají desítky milisekund, spojení po Praze pod
-sekundu a dálková 2–3 s. Docker image obsahuje jen tento index, GTFS soubory
-v něm nejsou. Každé volání nástroje (parametry, doba, případná chyba) se
-zapíše do logu kontejneru.
+asi 1–2 minuty). Docker image obsahuje jen tento index, GTFS soubory v něm
+nejsou. Server po startu index předehřeje (zastávky, chodníky, dnešní spoje).
+Každé volání nástroje (parametry, doba, případná chyba) se zapíše do logu
+kontejneru.
 
 Spojení hledá algoritmus Connection Scan nad úseky spojů seřazenými podle
-odjezdu. Přestup na stejné zastávce trvá nejméně 2 minuty, pěšky se přestupuje
+odjezdu. Čte jen úseky spojů, které ten den jedou (filtruje je SQLite). U cesty
+delší než 40 km čte mimo okolí startu a cíle (20 km) jen dálkové spoje (vlaky
+a linky s dosahem přes 30 km); místní spoje u startu jen první hodinu a půl,
+u cíle až od nejdřívějšího možného příjezdu. Další spojení hledá znovu
+přes už načtené úseky. Hledání má časový rozpočet: první spojení do 7 s, další
+jen do 1,5 s; co nestihne, vrátí s `"partial": true`.
+
+`scripts/bench_connections.py` změří sadu dotazů (index z `GTFS_DB`):
+
+```powershell
+python scripts/bench_connections.py 2026-11-13 12:00
+```
+
+Na vývojovém PC (13. 11. 2026, 5:00 / 12:00 / 19:15), před → po úpravě:
+
+| Dotaz | Před | Po |
+|---|---|---|
+| Drinopol → Můstek | 0,3 s | 0,24–0,36 s |
+| Drinopol → Větřkovice | 2,0–2,7 s, nic nenašel | 1,7–1,9 s, 2–3 spojení (19:15: žádné do půlnoci) |
+| Televizní věž → Praha hl. n. | 0,3 s | 0,2–0,4 s |
+| Praha hl. n. → Brno hl. n. | 1,4–2,9 s | 0,5–0,7 s |
+
+Přestup na stejné zastávce trvá nejméně 2 minuty, pěšky se přestupuje
 mezi zastávkami do 400 m vzdušnou čarou (1 m/s, zaokrouhleno na minuty).
 Upstream data mají dvě vady, se kterými index počítá:
 
@@ -37,6 +63,25 @@ Upstream data mají dvě vady, se kterými index počítá:
   spoj z ní zdánlivě přeskočí přes republiku; úseky rychlejší než 200 km/h
   na vzdálenost nad 2 km se proto do plánovače nedostanou,
 - 384 zastávek má souřadnice 0,0; z nich ani na ně se pěšky nepřestupuje.
+
+## Aktuální zpoždění (Praha)
+
+S proměnnou `GOLEMIO_API_KEY` (klíč zdarma po registraci na
+[api.golemio.cz](https://api.golemio.cz)) server pro dnešní dotazy čte
+odjezdové tabule PID z Golemio API. K odjezdům z pražských zastávek
+(`departures` a jízdy v `connections`, které vyjíždějí do 3 hodin) přidá
+`delay_minutes`, `realtime_departure` a `canceled` a do `summary` třeba
+„(zpoždění 3 min)“. Odjezd páruje podle názvu zastávky bez „Praha, “, linky,
+času podle jízdního řádu a směru. Tabule se drží 30 s; když Golemio do 2 s
+neodpoví nebo klíč chybí, odpověď je jen podle jízdního řádu. Spojení se
+podle zpoždění nepřepočítávají.
+
+V Compose klíč předá `.env` vedle `compose.yaml` nebo proměnné stacku
+v Portaineru:
+
+```text
+GOLEMIO_API_KEY=<váš klíč>
+```
 
 ## Získání zdrojů
 
