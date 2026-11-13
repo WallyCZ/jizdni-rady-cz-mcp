@@ -13,7 +13,7 @@ import threading
 import time
 import sqlite3
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -571,7 +571,8 @@ def connections(
 
     from_stop a to_stop jsou názvy zastávek, jak je řekl uživatel (stop_id ani
     search_stops nejsou potřeba, pádové tvary jako „z Drinopolu“ „na Radlickou“
-    fungují). Bez service_date a from_time hledá dnes od teď.
+    fungují). Bez service_date a from_time hledá dnes od teď, a když dnes už
+    nic nejede, zítra od 4:00 (service_date ve výsledku říká, který den).
 
     Vrátí nejbližší spojení seřazená podle odjezdu. Každé má celou trasu v legs:
     jízdy (linka, druh dopravy, nástupní a výstupní zastávka, odjezd, příjezd)
@@ -590,26 +591,33 @@ def connections(
     max_rides = max(0, min(max_changes, 4)) + 1
     footpaths = _footpaths()
     started = time.monotonic()
-    deadline = started + _TIME_BUDGET
 
-    found: list[dict[str, Any]] = []
-    seen: set[tuple] = set()
-    partial = False
-    search_from, last = start, start + _SEARCH_WINDOW
-    with _planning:
-        _prepare(day)
-        hops = _Replay(_hops(origins, destinations, start))
-        while len(found) < limit and search_from <= last:
-            journeys, complete = planner.earliest(
-                hops.since(search_from), footpaths, origin_ids, destination_ids,
-                search_from, max_rides, _CHANGE_TIME, deadline)
-            search_from = _collect(journeys, found, seen, search_from)
-            if not journeys:
-                partial = not complete
-                break
-            if not complete or time.monotonic() > min(deadline, started + _MORE_BUDGET):
-                partial = len(found) < limit
-                break
+    def search(day: date, start: int) -> tuple[list[dict[str, Any]], bool]:
+        found: list[dict[str, Any]] = []
+        seen: set[tuple] = set()
+        deadline = started + _TIME_BUDGET
+        search_from, last = start, start + _SEARCH_WINDOW
+        with _planning:
+            _prepare(day)
+            hops = _Replay(_hops(origins, destinations, start))
+            while len(found) < limit and search_from <= last:
+                journeys, complete = planner.earliest(
+                    hops.since(search_from), footpaths, origin_ids, destination_ids,
+                    search_from, max_rides, _CHANGE_TIME, deadline)
+                search_from = _collect(journeys, found, seen, search_from)
+                if not journeys:
+                    return found, not complete
+                if not complete or time.monotonic() > min(deadline, started + _MORE_BUDGET):
+                    return found, len(found) < limit
+        return found, False
+
+    found, partial = search(day, start)
+    if not found and not partial and service_date is None and from_time is None:
+        # Nothing more today: the nearest connection is tomorrow's first,
+        # from the early morning (from midnight it would wait for hours).
+        found, partial = search(day + timedelta(days=1), _NEXT_DAY_FROM)
+        if found:
+            day += timedelta(days=1)
     found.sort(key=lambda item: (item["departure_time"], item["arrival_time"]))
     del found[limit:]
     if _is_today(day):
@@ -690,6 +698,7 @@ _SEARCH_WINDOW = 4 * 3600   # s after from_time in which departures are looked f
 _TIME_BUDGET = 7.0          # s a search may take; then it returns what it has
 _MORE_BUDGET = 1.5          # s after which it looks for no more connections
 _REALTIME_BUDGET = 2.0      # s to wait for Golemio's departure boards
+_NEXT_DAY_FROM = 4 * 3600   # s, from when tomorrow is searched when today has nothing
 _LONG_JOURNEY_KM = 40       # beyond this the middle of a journey is long trips only
 _NEAR_KM = 20               # around each end local trips count too
 _LEAVE_ORIGIN = 90 * 60     # s in which a long journey leaves its origin's area

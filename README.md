@@ -19,6 +19,7 @@ přes standardní vstup/výstup, proto nemá ani nepotřebuje síťový port.
   úsek s linkou, druhem dopravy, časy a přestupy pěšky. Umí dnešní datum,
   aktuální čas i běžné české pádové tvary názvů („z Drinopolu na Radlickou“).
   Název obce bez zastávky („do Větřkovic“) znamená kteroukoli její zastávku.
+  Bez data a času hledá od teď, a když dnes už nic nejede, zítra od 4:00.
 
 Oba nástroje respektují GTFS kalendář i výjimky (`calendar_dates.txt`). Časy
 po půlnoci jsou podle GTFS větší než 24:00 (`24:03:00` je 0:03 dalšího dne).
