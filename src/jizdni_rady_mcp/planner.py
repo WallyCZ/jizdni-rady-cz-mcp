@@ -42,6 +42,7 @@ def earliest(
     max_rides: int,
     change_time: int,
     deadline: float,
+    boarding: dict[int, int] | None = None,
 ) -> tuple[list[tuple[int, list[Ride | Walk]]], bool]:
     """Pareto-optimal journeys (arrival, legs) leaving one of origins at start
     or later for one of destinations: each arrives earlier than every journey
@@ -49,7 +50,9 @@ def earliest(
     stop_sequence)
     of the trips running that day, from start on, in departure order. The
     second value is False when the scan stopped at the deadline
-    (time.monotonic()) before it was complete."""
+    (time.monotonic()) before it was complete. boarding: trip -> seconds a
+    change onto it takes on top (the metro's and trains' platforms)."""
+    boarding = boarding or {}
     # arrival[k][stop]: earliest arrival there with k rides; ready[k][stop]:
     # when a trip can be boarded there (arrival plus the change time).
     arrival = [dict[int, int]() for _ in range(max_rides + 1)]
@@ -77,9 +80,11 @@ def earliest(
             complete = False
             break
         rides = trip_rides.get(trip)
-        # Board here if this stop was reached in time with fewer rides.
+        # Board here if this stop was reached in time with fewer rides; a
+        # change (k > 0) onto the metro or a train takes longer.
+        extra = boarding.get(trip, 0)
         for k in range(0, max_rides if rides is None else rides - 1):
-            if ready[k].get(from_stop, INF) <= departure:
+            if ready[k].get(from_stop, INF) + (extra if k else 0) <= departure:
                 rides = trip_rides[trip] = k + 1
                 trip_board[trip] = (from_stop, departure)
                 break

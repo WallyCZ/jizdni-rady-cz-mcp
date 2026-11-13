@@ -167,10 +167,10 @@ def _town(name: str) -> str:
     return name.split(",")[0].strip()
 
 
-def _resolve_stops(query: str) -> list[dict[str, str]]:
+def _resolve_stops(query: str, near: tuple[float, float] | None = None) -> list[dict[str, str]]:
     """The stop the query names; when it names a town ("do Větřkovic") and no
     stop exactly, all the town's stops, so a search may arrive at any."""
-    stop = _resolve_stop(query)
+    stop = _resolve_stop(query, near)
     if _normalized(stop["stop_name"]) == _normalized(query):
         return [stop]
     tokens = _stop_tokens(query)
@@ -179,19 +179,25 @@ def _resolve_stops(query: str) -> list[dict[str, str]]:
     return town or [stop]
 
 
-def _resolve_stop(query: str) -> dict[str, str]:
+def _resolve_stop(query: str, near: tuple[float, float] | None = None) -> dict[str, str]:
+    """The stop whose name holds the query's words: an exact name first, then
+    of the stops of that name in different towns the one nearest to near (the
+    journey's other end: "Hlavní nádraží" from a Prague stop is Prague's), then
+    the shortest name."""
     query_tokens = _stop_tokens(query)
     if not query_tokens:
         raise ValueError("Název zastávky nesmí být prázdný.")
+    points = _coordinates() if near else {}
     candidates = []
     for stop, name_tokens in _stop_index():
         name = stop["stop_name"]
         if query_tokens <= name_tokens:
             exact = _normalized(query) == _normalized(name)
-            candidates.append((not exact, len(name), name, stop))
+            distance = _km(points[stop["id"]], near) if stop["id"] in points else 1e9 if near else 0
+            candidates.append((not exact, round(distance / _SAME_PLACE_KM), len(name), name, stop))
     if not candidates:
         raise ValueError(f"Zastávka nenalezena: {query}. Použijte search_stops pro přesný název.")
-    return sorted(candidates, key=lambda item: item[:3])[0][3]
+    return sorted(candidates, key=lambda item: item[:4])[0][4]
 
 
 @mcp.tool()
@@ -325,6 +331,13 @@ def _footpaths() -> dict[int, list[tuple[int, int]]]:
 
 
 @lru_cache(maxsize=1)
+def _platform_trips() -> dict[int, int]:
+    """Trips of the metro and trains: a change onto one takes _PLATFORM_CHANGE more."""
+    return {trip: _PLATFORM_CHANGE for (trip,) in _query(
+        "SELECT t.id FROM trips t JOIN routes r ON r.route_id = t.route_id WHERE r.route_type IN ('1', '2')")}
+
+
+@lru_cache(maxsize=1)
 def _service_numbers() -> dict[str, int]:
     return {service_id: number for number, service_id in _query("SELECT id, service_id FROM services")}
 
@@ -375,8 +388,14 @@ def warm_up(service_date: str | None = None) -> None:
     _stop_index()
     _footpaths()
     _coordinates()
+    _platform_trips()
     with _planning:
         _prepare(_requested_date(service_date))
+
+
+def _centre(stops: list[dict[str, str]]) -> tuple[float, float] | None:
+    ends = _ends(stops)
+    return ends[0] if ends else None
 
 
 def _ends(stops: list[dict[str, str]]) -> tuple[tuple[float, float], float] | None:
@@ -580,7 +599,12 @@ def connections(
     řádu včetně návazností, takže ho uživateli podej tak, jak je; neskládej
     spojení sám z departures. Časy nad 24:00 jsou po půlnoci.
     """
-    origins, destinations = _resolve_stops(from_stop), _resolve_stops(to_stop)
+    # Each end is resolved near the other: "Hlavní nádraží" means Prague's
+    # from Drinopol and Brno's from Brno, Královo Pole.
+    origins = _resolve_stops(from_stop)
+    destinations = _resolve_stops(to_stop, _centre(origins))
+    origins = _resolve_stops(from_stop, _centre(destinations))
+    destinations = _resolve_stops(to_stop, _centre(origins))
     origin_ids = {stop["id"] for stop in origins}
     destination_ids = {stop["id"] for stop in destinations}
     if origin_ids & destination_ids:
@@ -603,7 +627,7 @@ def connections(
             while len(found) < limit and search_from <= last:
                 journeys, complete = planner.earliest(
                     hops.since(search_from), footpaths, origin_ids, destination_ids,
-                    search_from, max_rides, _CHANGE_TIME, deadline)
+                    search_from, max_rides, _CHANGE_TIME, deadline, _platform_trips())
                 search_from = _collect(journeys, found, seen, search_from)
                 if not journeys:
                     return found, not complete
@@ -699,6 +723,8 @@ _TIME_BUDGET = 7.0          # s a search may take; then it returns what it has
 _MORE_BUDGET = 1.5          # s after which it looks for no more connections
 _REALTIME_BUDGET = 2.0      # s to wait for Golemio's departure boards
 _NEXT_DAY_FROM = 4 * 3600   # s, from when tomorrow is searched when today has nothing
+_SAME_PLACE_KM = 10         # stops of one name this close count as equally near
+_PLATFORM_CHANGE = 120      # s more to change onto the metro or a train (platforms, stairs)
 _LONG_JOURNEY_KM = 40       # beyond this the middle of a journey is long trips only
 _NEAR_KM = 20               # around each end local trips count too
 _LEAVE_ORIGIN = 90 * 60     # s in which a long journey leaves its origin's area
