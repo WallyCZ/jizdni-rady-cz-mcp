@@ -781,8 +781,8 @@ def disruptions(
 ) -> list[dict[str, Any]]:
     """Výluky a mimořádnosti pražské integrované dopravy (PID) z pid.cz.
 
-    lines: linky, kterých se mají týkat (["22", "25"]); stop: název zastávky,
-    který má být v titulku nebo textu („Drinopol“, „Malovanka“). Bez
+    lines: linky, kterých se mají týkat (["22", "25"]); stop: zastávka („Drinopol“)
+    – výluky, které ji zmiňují nebo se týkají linek, které jí projíždějí. Bez
     active_now=False jen ty, které platí teď, jinak i budoucí. Každá má title,
     lines, valid_from, valid_to (nebo „do odvolání“), link, kind (výluka nebo
     mimořádnost) a description, krátký text, je-li. Použij, když spoj nejede
@@ -790,7 +790,22 @@ def disruptions(
     """
     if isinstance(lines, str):          # "22" or "22, 25" from an assistant
         lines = [line for line in re.split(r"[,\s]+", lines) if line]
-    return pid_disruptions.find(lines, stop, active_now, max(1, min(limit, 30)))
+    return pid_disruptions.find(lines, stop, active_now, max(1, min(limit, 30)), _stop_lines(stop))
+
+
+def _stop_lines(stop: str | None) -> set[str]:
+    """Lines serving stop in the timetable, a replacement X22 counting as 22."""
+    if not stop:
+        return set()
+    try:
+        place = _stop_by_id_or_name(stop)
+    except ValueError:
+        return set()
+    names = {row[0] for row in _query(
+        """SELECT DISTINCT r.route_short_name FROM stop_times st JOIN trips t ON t.id = st.trip
+           JOIN routes r ON r.route_id = t.route_id
+           WHERE st.stop = (SELECT id FROM stops WHERE stop_id = ?)""", place["stop_id"]) if row[0]}
+    return names | {name[1:] for name in names if name.upper().startswith("X") and len(name) > 1}
 
 
 def _place(stops: list[dict[str, str]]) -> dict[str, str]:

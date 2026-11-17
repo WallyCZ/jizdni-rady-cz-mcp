@@ -35,19 +35,25 @@ _cache: dict[str, tuple[float, list[dict]]] = {}
 _lock = threading.Lock()
 
 
-def find(lines: list[str] | None, stop: str | None, active_now: bool, limit: int) -> list[dict]:
-    """Closures and incidents affecting any of lines and naming stop in the
-    title or text; active now, or with active_now False also those to come.
-    The ones in force first, the most recently begun first: today's closure
-    before a stop moved "until further notice" years ago."""
+def find(lines: list[str] | None, stop: str | None, active_now: bool, limit: int,
+         stop_lines: set[str] | None = None) -> list[dict]:
+    """Closures and incidents affecting any of lines and concerning stop: naming
+    it in the title or text, or affecting a line that serves it (stop_lines;
+    a closure of the tracks beyond Drinopol does not name it); active now, or
+    with active_now False also those to come. The ones in force first, the
+    most recently begun first: today's closure before a stop moved "until
+    further notice" years ago."""
     now = time.time()
     wanted = {line.strip().upper() for line in lines or [] if line.strip()}
     place = _normalized(stop.split(",")[-1]) if stop else None   # "Praha, Drinopol" -> drinopol
+    serving = {line.upper() for line in stop_lines or ()}
     found = []
     for item in _items():
-        if wanted and not wanted & {line.upper() for line in item["lines"]}:
+        affected = {line.upper() for line in item["lines"]}
+        if wanted and not wanted & affected:
             continue
-        if place and place not in _normalized(item["title"] + " " + item["_text"]):
+        if place and place not in _normalized(item["title"] + " " + item["_text"]) \
+                and not serving & affected:
             continue
         starts, ends = item["_from"], item["_to"]
         running = (starts is None or starts <= now) and (ends is None or now <= ends)
