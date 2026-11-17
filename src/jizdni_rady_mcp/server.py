@@ -8,6 +8,7 @@ import heapq
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -773,7 +774,7 @@ def _collect(journeys, found: list[dict[str, Any]], seen: set[tuple], search_fro
 @mcp.tool()
 @_logged
 def disruptions(
-    lines: list[str] | None = None,
+    lines: list[str] | str | None = None,
     stop: str | None = None,
     active_now: bool = True,
     limit: int = 5,
@@ -787,6 +788,8 @@ def disruptions(
     mimořádnost) a description, krátký text, je-li. Použij, když spoj nejede
     nebo se uživatel ptá na výluky; uživateli stačí titulek a platnost.
     """
+    if isinstance(lines, str):          # "22" or "22, 25" from an assistant
+        lines = [line for line in re.split(r"[,\s]+", lines) if line]
     return pid_disruptions.find(lines, stop, active_now, max(1, min(limit, 30)))
 
 

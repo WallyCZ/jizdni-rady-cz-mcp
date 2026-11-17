@@ -38,7 +38,8 @@ _lock = threading.Lock()
 def find(lines: list[str] | None, stop: str | None, active_now: bool, limit: int) -> list[dict]:
     """Closures and incidents affecting any of lines and naming stop in the
     title or text; active now, or with active_now False also those to come.
-    The ones in force first, then by start."""
+    The ones in force first, the most recently begun first: today's closure
+    before a stop moved "until further notice" years ago."""
     now = time.time()
     wanted = {line.strip().upper() for line in lines or [] if line.strip()}
     place = _normalized(stop.split(",")[-1]) if stop else None   # "Praha, Drinopol" -> drinopol
@@ -54,7 +55,7 @@ def find(lines: list[str] | None, stop: str | None, active_now: bool, limit: int
             continue
         if not active_now and ends is not None and ends < now:
             continue
-        found.append((not running, starts or 0, item))
+        found.append((not running, -(starts or 0) if running else starts or 0, item))
     found.sort(key=lambda entry: entry[:2])
     return [{key: value for key, value in item.items() if not key.startswith("_")}
             for _, _, item in found[:limit]]
