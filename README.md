@@ -1,8 +1,11 @@
 # Jízdní řády ČR — MCP server
 
-Read-only MCP server nad soubory `data/merged` z repozitáře
-[tangero/jizdni-rady-czech-republic](https://github.com/tangero/jizdni-rady-czech-republic),
-který je zde připojený jako git submodul `upstream/`. Komunikuje
+Read-only MCP server nad GTFS daty z repozitáře
+[tangero/jizdni-rady-czech-republic](https://github.com/tangero/jizdni-rady-czech-republic)
+(připojený jako git submodul `upstream/`). Docker image bere data z jeho
+týdenního releasu `data-RRRR-MM-DD` (viz `ARG UPSTREAM_RELEASE` v `Dockerfile`):
+do `main` upstream commituje data jen jednou za měsíc a pražské jízdní řády
+v nich platí jen zhruba dva týdny dopředu. Komunikuje
 přes standardní vstup/výstup, proto nemá ani nepotřebuje síťový port.
 
 ## Nástroje
@@ -12,7 +15,10 @@ přes standardní vstup/výstup, proto nemá ani nepotřebuje síťový port.
 - `search_routes` — vyhledání linek podle čísla či názvu.
 - `departures` — odjezdová tabule zastávky (název nebo `stop_id`): nejbližší
   odjezdy se směrem (konečnou), bez zadání dnes od teď na 3 hodiny dopředu.
-  U pražských zastávek s aktuálním zpožděním (viz níže).
+  U pražských zastávek s aktuálním zpožděním (viz níže) a dnes i s náhradní
+  dopravou, kterou jízdní řád nemá (`substitute: true`, `platform` = stanoviště,
+  třeba dočasné „Z1“). Bere i ID stanoviště PID („U103Z51P“) nebo název se
+  stanovištěm („Drinopol Z1“), i když zastávka v jízdním řádu není.
 - `connections` — spojení mezi dvěma názvy zastávek, přímá i s přestupy
   (nejvýš `max_changes`, výchozí 4), výchozí 3 nejbližší. Vynechá spojení,
   které je horší v odjezdu, příjezdu i počtu přestupů než jiné nalezené; každý
@@ -20,6 +26,12 @@ přes standardní vstup/výstup, proto nemá ani nepotřebuje síťový port.
   aktuální čas i běžné české pádové tvary názvů („z Drinopolu na Radlickou“).
   Název obce bez zastávky („do Větřkovic“) znamená kteroukoli její zastávku.
   Bez data a času hledá od teď, a když dnes už nic nejede, zítra od 4:00.
+
+- `disruptions` — výluky a mimořádnosti PID z RSS pid.cz
+  (`rss-vyluky`, `rss-mimoradnosti`): titulek, dotčené linky, platnost od–do
+  (nebo „do odvolání“), odkaz a krátký popis. Filtr podle linek
+  (`lines=["22"]`), podle zastávky v titulku či textu (`stop`) a podle
+  platnosti teď (`active_now`). Feedy se drží 10 minut.
 
 Oba nástroje respektují GTFS kalendář i výjimky (`calendar_dates.txt`). Časy
 po půlnoci jsou podle GTFS větší než 24:00 (`24:03:00` je 0:03 dalšího dne).
@@ -92,9 +104,10 @@ git clone --recursive https://github.com/WallyCZ/jizdni-rady-cz-mcp.git
 git submodule update --init
 ```
 
-Na nejnovější data z upstreamu se submodul posune příkazem
-`git submodule update --remote upstream` (v GitHub Actions to dělá každý den
-workflow `update-upstream.yml`).
+Workflow `update-upstream.yml` každý den zjistí nejnovější datový release
+upstreamu, přepíše `ARG UPSTREAM_RELEASE` v `Dockerfile`, posune submodul
+a spustí sestavení image. Docker build si zip releasu stáhne sám, submodul
+k sestavení image potřeba není.
 
 ## Hotový image (GitHub Packages)
 

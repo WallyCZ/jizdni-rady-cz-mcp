@@ -1,13 +1,18 @@
-# Každý den posune submodul upstream (tangero/jizdni-rady-czech-republic)
-# na nejnovější commit jeho main. Když se změnil, commitne to a spustí
-# sestavení image (push z GITHUB_TOKEN jiné workflow nespouští,
-# workflow_dispatch ano). Beze změny v upstreamu nedělá nic.
+# Každý den zjistí nejnovější datový release upstreamu
+# (tangero/jizdni-rady-czech-republic, tagy data-RRRR-MM-DD, vychází každé
+# pondělí) a když je novější než ten v Dockerfile (ARG UPSTREAM_RELEASE),
+# přepíše ho, posune i submodul upstream na nejnovější main, commitne to
+# a spustí sestavení image (push z GITHUB_TOKEN jiné workflow nespouští,
+# workflow_dispatch ano). Beze změny nedělá nic.
+#
+# Release, ne main: do main upstream commituje data jen jednou za měsíc
+# a pražské jízdní řády v nich platí jen asi dva týdny dopředu.
 
 name: Aktualizace upstream
 
 on:
   schedule:
-    - cron: '17 5 * * *'  # denně 05:17 UTC (upstream data obnovuje v pondělí 04:00 UTC)
+    - cron: '17 5 * * *'  # denně 05:17 UTC (upstream vydává data v pondělí 04:00 UTC)
   workflow_dispatch:
 
 permissions:
@@ -22,18 +27,26 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Posun submodulu
+      - name: Nejnovější data a submodul
         id: bump
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          latest=$(gh release list -R tangero/jizdni-rady-czech-republic --limit 20 \
+                     --json tagName --jq '[.[].tagName | select(startswith("data-"))] | sort | last')
+          current=$(sed -n 's/^ARG UPSTREAM_RELEASE=//p' Dockerfile)
+          echo "release: $current -> $latest"
+          if [ -n "$latest" ] && [ "$latest" != "$current" ]; then
+            sed -i "s/^ARG UPSTREAM_RELEASE=.*/ARG UPSTREAM_RELEASE=$latest/" Dockerfile
+          fi
           git submodule update --remote upstream
           if git diff --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          rev=$(git -C upstream log -1 --format='%h %s')
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -am "chore: upstream -> $rev"
+          git commit -am "chore: upstream data $latest, submodule $(git -C upstream log -1 --format=%h)"
           git push
           echo "changed=true" >> "$GITHUB_OUTPUT"
 

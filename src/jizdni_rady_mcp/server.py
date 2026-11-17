@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 from mcp.server.fastmcp import FastMCP
 
-from . import planner, realtime
+from . import disruptions as pid_disruptions, planner, realtime
 from .index import build
 
 mcp = FastMCP(
@@ -29,7 +29,8 @@ mcp = FastMCP(
     instructions=(
         "Jízdní řády veřejné dopravy v ČR. Na otázku, jak se dostat z jednoho místa "
         "na druhé, zavolej connections s názvy obou zastávek: vrátí hotová spojení "
-        "i s přestupy. departures je jen odjezdová tabule jedné zastávky."
+        "i s přestupy. departures je jen odjezdová tabule jedné zastávky (v Praze "
+        "i s náhradní dopravou). Na výluky a mimořádnosti PID zavolej disruptions."
     ),
 )
 DATASET = Path(os.environ.get("GTFS_DATASET", "data/merged"))
@@ -271,18 +272,28 @@ def departures(
     """Odjezdová tabule jedné zastávky: nejbližší odjezdy linek a jejich směr.
 
     stop je název zastávky, jak ho řekl uživatel („Drinopol“, „z Anděla“),
-    nebo stop_id ze search_stops. Bez service_date a from_time ukáže odjezdy
-    dnes od teď, bez to_time na 3 hodiny dopředu. direction je konečná spoje.
-    Na cestu z A do B použij connections, ne tento nástroj. Časy nad 24:00
-    jsou po půlnoci.
+    nebo stop_id ze search_stops; v Praze i ID stanoviště PID („U103Z51P“)
+    nebo název se stanovištěm („Drinopol Z1“). Bez service_date a from_time
+    ukáže odjezdy dnes od teď, bez to_time na 3 hodiny dopředu. direction je
+    konečná spoje. Dnes v Praze přidá i náhradní dopravu při výlukách
+    (substitute: true, s platform = stanoviště, třeba dočasné „Z1“) a ke
+    spojům zpoždění. Na cestu z A do B použij connections, ne tento nástroj.
+    Časy nad 24:00 jsou po půlnoci.
     """
-    place = _stop_by_id_or_name(stop)
     day = _requested_date(service_date)
     start = _start(day, from_time)
     end = _seconds(to_time) if to_time else start + 3 * 3600
     if start > end:
         raise ValueError("from_time musí být před to_time.")
     limit = max(1, min(limit, 100))
+    try:
+        place = _stop_by_id_or_name(stop)
+    except ValueError:
+        # Not in the timetable: maybe a PID stand, a temporary one included.
+        found = realtime.stand_board(stop, _REALTIME_BUDGET) if _is_today(day) else None
+        if not found:
+            raise
+        return _stand_departures(stop, found[0], found[1], day, start, end, limit)
     active = _active_services(day)
     rows = _db().execute(
         """SELECT st.departure, t.trip_id, t.service_id, r.route_short_name, r.route_long_name,
@@ -309,17 +320,67 @@ def departures(
             "route_long_name": row["route_long_name"] or "",
             "trip_id": row["trip_id"],
         })
+        if (row["route_short_name"] or "").upper().startswith("X"):
+            found[-1]["substitute"] = True      # PID's replacement lines are X + the line
         if len(found) == limit:
             break
     if _is_today(day):
         board = realtime.boards({place["stop_name"]}, _REALTIME_BUDGET).get(place["stop_name"])
         for item in found:
             _add_delay(item, board, item["route_short_name"], item["departure_time"], item["direction"])
+        if board:
+            # Replacement transport the timetable lacks (a closure announced
+            # after the data was published) is only on the board.
+            listed = {(item["route_short_name"], item["departure_time"][:5]) for item in found}
+            found += [_board_item(departure, day) for departure in board.departures
+                      if departure.substitute
+                      and (departure.route, _clock(_since_midnight(departure.scheduled, day))[:5]) not in listed
+                      and start <= _since_midnight(departure.predicted, day) <= end]
+            found.sort(key=lambda item: item["departure_time"])
+            del found[limit:]
     return {
         "stop": {key: place.get(key, "") for key in ("stop_id", "stop_name")},
         "service_date": day.isoformat(),
         "departures": found,
     }
+
+
+def _stand_departures(query: str, board, platform: str | None, day: date,
+                      start: int, end: int, limit: int) -> dict[str, Any]:
+    """departures of a stop known only to Golemio: a PID stand, temporary ones too."""
+    chosen = [departure for departure in board.departures
+              if (platform is None or departure.platform == platform)
+              and start <= _since_midnight(departure.predicted, day) <= end]
+    chosen.sort(key=lambda departure: departure.predicted)
+    stop_id = chosen[0].stop_id if chosen else next(iter(board.stop_names), query)
+    name = board.stop_names.get(stop_id) or query
+    if platform is None and chosen and len(board.stop_names) == 1:
+        platform = chosen[0].platform        # asked by stand id: name the stand too
+    return {
+        "stop": {"stop_id": stop_id, "stop_name": f"{name} {platform}" if platform else name},
+        "service_date": day.isoformat(),
+        "departures": [_board_item(departure, day) for departure in chosen[:limit]],
+    }
+
+
+def _board_item(departure, day: date) -> dict[str, Any]:
+    item = {
+        "departure_time": _clock(_since_midnight(departure.predicted, day)),
+        "route_short_name": departure.route,
+        "mode": _MODES.get(str(departure.mode), "") if departure.mode is not None else "",
+        "direction": departure.headsign,
+        "delay_minutes": departure.delay_minutes,
+        "platform": departure.platform,
+        "canceled": departure.canceled,
+    }
+    if departure.substitute:
+        item["substitute"] = True
+    return item
+
+
+def _since_midnight(moment: datetime, day: date) -> int:
+    """Seconds from the start of day to moment, past 24 h for the next day (GTFS style)."""
+    return (moment.date() - day).days * 86400 + moment.hour * 3600 + moment.minute * 60 + moment.second
 
 
 @lru_cache(maxsize=1)
@@ -707,6 +768,26 @@ def _collect(journeys, found: list[dict[str, Any]], seen: set[tuple], search_fro
         and other["arrival_time"] <= item["arrival_time"] and other["changes"] <= item["changes"]
         for other in found)]
     return min(first_departures) + 60
+
+
+@mcp.tool()
+@_logged
+def disruptions(
+    lines: list[str] | None = None,
+    stop: str | None = None,
+    active_now: bool = True,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Výluky a mimořádnosti pražské integrované dopravy (PID) z pid.cz.
+
+    lines: linky, kterých se mají týkat (["22", "25"]); stop: název zastávky,
+    který má být v titulku nebo textu („Drinopol“, „Malovanka“). Bez
+    active_now=False jen ty, které platí teď, jinak i budoucí. Každá má title,
+    lines, valid_from, valid_to (nebo „do odvolání“), link, kind (výluka nebo
+    mimořádnost) a description, krátký text, je-li. Použij, když spoj nejede
+    nebo se uživatel ptá na výluky; uživateli stačí titulek a platnost.
+    """
+    return pid_disruptions.find(lines, stop, active_now, max(1, min(limit, 30)))
 
 
 def _place(stops: list[dict[str, str]]) -> dict[str, str]:
